@@ -9,6 +9,9 @@ from enum import Enum
 import os
 from twilio.rest import Client
 import replicate
+import sqlite3
+from contextlib import contextmanager
+import json
 
 # ============================
 # CONFIGURATION
@@ -30,11 +33,95 @@ TWILIO_FLOW_SID = os.getenv("TWILIO_FLOW_SID", "FW89c0acdcdb206b39fd8dcbc31d3833
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "+15097613429")
 USER_PHONE_NUMBER = os.getenv("USER_PHONE")
 
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = "7909041524:AAHOKcfbhVR8-Pb2CfiQ2k_eKF-doeJFwn4"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# OpenAI API (via Replicate or direct)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 # Initialize clients
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-app = FastAPI(title="Jarvis on Celo", version="2.0.0")
+app = FastAPI(title="Jarvis on Celo", version="3.0.0")
+
+# ============================
+# DATABASE SETUP
+# ============================
+DB_PATH = "jarvis.db"
+
+def init_database():
+    """Initialize SQLite database with required tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Users table - store telegram user info
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            username TEXT,
+            wallet_address TEXT,
+            phone_number TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Actions table - store proposed actions and decisions
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS actions (
+            action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            alert_message TEXT NOT NULL,
+            proposed_action TEXT NOT NULL,
+            action_details TEXT,
+            status TEXT DEFAULT 'pending',
+            user_response TEXT,
+            telegram_message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            responded_at TIMESTAMP,
+            executed_at TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    """)
+    
+    # Alerts history
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alert_history (
+            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            wallet_address TEXT,
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            metrics TEXT,
+            ai_summary TEXT,
+            call_initiated BOOLEAN DEFAULT 0,
+            telegram_sent BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+@contextmanager
+def get_db():
+    """Context manager for database connections"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# Initialize database on startup
+init_database()
 
 # ============================
 # CORS MIDDLEWARE
@@ -96,14 +183,28 @@ class AlertResponse(BaseModel):
     wallet: Optional[WalletPortfolio] = None
     alert: Optional[RiskAlert] = None
     aiSummary: Optional[str] = None
+    proposedAction: Optional[str] = None
     callInitiated: bool = False
+    telegramSent: bool = False
 
 class TestAlertRequest(BaseModel):
     alertType: str
     phoneCall: bool = True
+    telegramUserId: Optional[int] = None
 
 class WalletMonitorRequest(BaseModel):
     walletAddress: str
+    telegramUserId: Optional[int] = None
+
+class TelegramUserRegister(BaseModel):
+    telegram_id: int
+    username: Optional[str] = None
+    wallet_address: Optional[str] = None
+    phone_number: Optional[str] = None
+
+class ActionResponse(BaseModel):
+    action_id: int
+    response: str  # 'yes' or 'no'
 
 # ============================
 # STORAGE
@@ -112,6 +213,89 @@ pool_history: List[PoolData] = []
 wallet_portfolios: Dict[str, List[WalletPortfolio]] = {}
 monitoring_active = False
 monitored_wallets: set = set()
+pending_actions: Dict[int, dict] = {}  # action_id -> action details
+
+# ============================
+# DATABASE HELPER FUNCTIONS
+# ============================
+def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
+    """Get user by telegram ID"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def register_telegram_user(telegram_id: int, username: str = None, 
+                          wallet_address: str = None, phone_number: str = None) -> int:
+    """Register or update telegram user"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO users (telegram_id, username, wallet_address, phone_number)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                username = COALESCE(excluded.username, username),
+                wallet_address = COALESCE(excluded.wallet_address, wallet_address),
+                phone_number = COALESCE(excluded.phone_number, phone_number),
+                last_active = CURRENT_TIMESTAMP
+        """, (telegram_id, username, wallet_address, phone_number))
+        conn.commit()
+        cursor.execute("SELECT user_id FROM users WHERE telegram_id = ?", (telegram_id,))
+        return cursor.fetchone()[0]
+
+def save_action(user_id: int, alert_type: str, severity: str, 
+                alert_message: str, proposed_action: str, 
+                action_details: dict, telegram_message_id: int = None) -> int:
+    """Save proposed action to database"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO actions (user_id, alert_type, severity, alert_message, 
+                               proposed_action, action_details, telegram_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, alert_type, severity, alert_message, proposed_action, 
+              json.dumps(action_details), telegram_message_id))
+        conn.commit()
+        return cursor.lastrowid
+
+def update_action_response(action_id: int, response: str):
+    """Update action with user response"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        status = 'approved' if response.lower() == 'yes' else 'rejected'
+        cursor.execute("""
+            UPDATE actions 
+            SET status = ?, user_response = ?, responded_at = CURRENT_TIMESTAMP
+            WHERE action_id = ?
+        """, (status, response, action_id))
+        conn.commit()
+
+def mark_action_executed(action_id: int):
+    """Mark action as executed"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE actions 
+            SET status = 'executed', executed_at = CURRENT_TIMESTAMP
+            WHERE action_id = ?
+        """, (action_id,))
+        conn.commit()
+
+def save_alert_history(user_id: int, wallet_address: str, alert_type: str,
+                       severity: str, message: str, metrics: dict,
+                       ai_summary: str, call_initiated: bool, telegram_sent: bool):
+    """Save alert to history"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO alert_history 
+            (user_id, wallet_address, alert_type, severity, message, metrics, 
+             ai_summary, call_initiated, telegram_sent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, wallet_address, alert_type, severity, message, 
+              json.dumps(metrics), ai_summary, call_initiated, telegram_sent))
+        conn.commit()
 
 # ============================
 # HELPER FUNCTIONS - BLOCKCHAIN
@@ -157,7 +341,6 @@ async def get_balance(address: str, token: str = None) -> int:
     """Get balance of native CELO or ERC20 token"""
     async with httpx.AsyncClient() as client:
         if token is None:
-            # Get native CELO balance
             response = await client.post(
                 CELO_RPC_URL,
                 json={
@@ -170,8 +353,6 @@ async def get_balance(address: str, token: str = None) -> int:
             data = response.json()
             return int(data["result"], 16)
         else:
-            # Get ERC20 token balance
-            # balanceOf(address) function signature
             data_hex = "0x70a08231" + address[2:].zfill(64)
             response = await client.post(
                 CELO_RPC_URL,
@@ -192,17 +373,13 @@ async def get_balance(address: str, token: str = None) -> int:
 
 async def get_wallet_portfolio(wallet_address: str) -> WalletPortfolio:
     """Fetch complete wallet portfolio from Celo blockchain"""
-    
-    # Get CELO balance
     celo_balance_wei = await get_balance(wallet_address)
     celo_balance = celo_balance_wei / 1e18
     
-    # Known token addresses on Celo
     cUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a"
     cEUR_ADDRESS = "0xD8763CBa276a3738E6DE85b4b3bF5FDed6D6cA73"
     cREAL_ADDRESS = "0xe8537a3d056DA446677B9E9d6c5dB704EaAb4787"
     
-    # Get token balances
     cusd_balance_wei = await get_balance(wallet_address, cUSD_ADDRESS)
     ceur_balance_wei = await get_balance(wallet_address, cEUR_ADDRESS)
     creal_balance_wei = await get_balance(wallet_address, cREAL_ADDRESS)
@@ -211,54 +388,38 @@ async def get_wallet_portfolio(wallet_address: str) -> WalletPortfolio:
     ceur_balance = ceur_balance_wei / 1e18
     creal_balance = creal_balance_wei / 1e18
     
-    # Calculate total value
     total_value = (celo_balance * CELO_PRICE) + cusd_balance + ceur_balance + creal_balance
     
     tokens = []
     if cusd_balance > 0.01:
         tokens.append(TokenBalance(
-            token=cUSD_ADDRESS,
-            symbol="cUSD",
-            balance=str(cusd_balance_wei),
-            valueUSD=cusd_balance
+            token=cUSD_ADDRESS, symbol="cUSD",
+            balance=str(cusd_balance_wei), valueUSD=cusd_balance
         ))
     if ceur_balance > 0.01:
         tokens.append(TokenBalance(
-            token=cEUR_ADDRESS,
-            symbol="cEUR",
-            balance=str(ceur_balance_wei),
-            valueUSD=ceur_balance * 1.05  # rough EUR/USD
+            token=cEUR_ADDRESS, symbol="cEUR",
+            balance=str(ceur_balance_wei), valueUSD=ceur_balance * 1.05
         ))
     if creal_balance > 0.01:
         tokens.append(TokenBalance(
-            token=cREAL_ADDRESS,
-            symbol="cREAL",
-            balance=str(creal_balance_wei),
-            valueUSD=creal_balance * 0.20  # rough REAL/USD
+            token=cREAL_ADDRESS, symbol="cREAL",
+            balance=str(creal_balance_wei), valueUSD=creal_balance * 0.20
         ))
     
-    # Check for LP positions (simplified - would need more complex logic for production)
     positions = []
-    
-    # Check Ubeswap LP token balance
     lp_balance = await get_balance(wallet_address, UBESWAP_CELO_cUSD_POOL)
     if lp_balance > 0:
-        lp_value = (lp_balance / 1e18) * 2  # Simplified LP value calculation
+        lp_value = (lp_balance / 1e18) * 2
         positions.append(PositionData(
-            protocol="Ubeswap",
-            type="Liquidity Pool",
-            tokens=["CELO", "cUSD"],
-            value=lp_value,
-            apy=15.5
+            protocol="Ubeswap", type="Liquidity Pool",
+            tokens=["CELO", "cUSD"], value=lp_value, apy=15.5
         ))
     
     return WalletPortfolio(
-        address=wallet_address,
-        totalValueUSD=total_value,
-        celoBalance=str(celo_balance_wei),
-        cUSDBalance=str(cusd_balance_wei),
-        tokens=tokens,
-        positions=positions,
+        address=wallet_address, totalValueUSD=total_value,
+        celoBalance=str(celo_balance_wei), cUSDBalance=str(cusd_balance_wei),
+        tokens=tokens, positions=positions,
         timestamp=int(datetime.now().timestamp() * 1000)
     )
 
@@ -302,20 +463,17 @@ def detect_pool_anomalies(current: PoolData, history: List[PoolData]) -> Optiona
     return risks[0] if risks else None
 
 def detect_wallet_risks(current: WalletPortfolio, history: List[WalletPortfolio]) -> Optional[RiskAlert]:
-    """Detect risks in wallet portfolio"""
     if len(history) < 2:
         return None
     
     risks = []
     prev = history[-1]
-    
-    # Check for sudden value drop (potential rug pull)
     value_change = ((current.totalValueUSD - prev.totalValueUSD) / prev.totalValueUSD) * 100
     
     if value_change < -30:
         risks.append(RiskAlert(
             severity=Severity.CRITICAL,
-            message=f"Portfolio value dropped {abs(value_change):.1f}%! Potential rug pull detected",
+            message=f"Portfolio value dropped {abs(value_change):.1f}%! Potential rug pull",
             metrics={"valueChange": value_change, "currentValue": current.totalValueUSD},
             alertType="wallet_value_drop"
         ))
@@ -327,70 +485,102 @@ def detect_wallet_risks(current: WalletPortfolio, history: List[WalletPortfolio]
             alertType="wallet_value_drop"
         ))
     
-    # Check for LP position risks (impermanent loss)
     for pos in current.positions:
         if pos.type == "Liquidity Pool":
-            # Check if position value decreased significantly
             prev_pos = next((p for p in prev.positions if p.protocol == pos.protocol), None)
             if prev_pos and prev_pos.value > 0:
                 pos_change = ((pos.value - prev_pos.value) / prev_pos.value) * 100
                 if pos_change < -10:
                     risks.append(RiskAlert(
                         severity=Severity.MEDIUM,
-                        message=f"Impermanent loss risk: {pos.protocol} LP position down {abs(pos_change):.1f}%",
+                        message=f"Impermanent loss: {pos.protocol} LP down {abs(pos_change):.1f}%",
                         metrics={"positionChange": pos_change, "protocol": pos.protocol},
                         alertType="impermanent_loss"
                     ))
     
-    # Check for whale movements affecting pools
-    if len(history) >= 5:
-        avg_value = sum(h.totalValueUSD for h in history[-5:]) / 5
-        if current.totalValueUSD > avg_value * 2:
-            risks.append(RiskAlert(
-                severity=Severity.LOW,
-                message=f"Large inflow detected: Portfolio value increased {((current.totalValueUSD - avg_value) / avg_value * 100):.1f}%",
-                metrics={"valueIncrease": ((current.totalValueUSD - avg_value) / avg_value * 100)},
-                alertType="large_inflow"
-            ))
-    
     return risks[0] if risks else None
 
 # ============================
-# AI & COMMUNICATION
+# AI DECISION MAKING
 # ============================
-async def generate_ai_summary(alert: RiskAlert, context: dict) -> str:
+async def generate_action_decision(alert: RiskAlert, context: dict) -> dict:
+    """Use ChatGPT to decide what action to take"""
     try:
-        if alert.alertType.startswith("wallet_"):
-            prompt = f"""You are Jarvis, an AI DeFi risk analyst. Analyze this wallet portfolio alert and provide a brief 1-paragraph summary (3-4 sentences max) explaining what happened and what the user should do.
+        prompt = f"""You are Jarvis, an AI DeFi risk manager. Based on this alert, recommend ONE specific action.
 
 Alert Details:
 - Severity: {alert.severity}
-- Alert Type: {alert.alertType}
+- Type: {alert.alertType}
 - Message: {alert.message}
-- Wallet Address: {context.get('address', 'N/A')}
-- Total Portfolio Value: ${context.get('totalValue', 0):.2f}
-- Metrics: {alert.metrics}
+- Metrics: {json.dumps(alert.metrics)}
 
-Keep it concise, actionable, and easy to understand. Focus on protecting the user's assets."""
-        else:
-            prompt = f"""You are Jarvis, an AI DeFi risk analyst. Analyze this liquidity pool alert and provide a brief 1-paragraph summary (3-4 sentences max) explaining what happened and what the user should do.
+Context:
+{json.dumps(context, indent=2)}
 
-Alert Details:
-- Severity: {alert.severity}
-- Alert Type: {alert.alertType}
-- Message: {alert.message}
-- Current TVL: ${context.get('tvl', 0):.2f}
-- CELO/cUSD Ratio: {context.get('ratio', 0):.4f}
-- Metrics: {alert.metrics}
+Provide your response in this EXACT JSON format:
+{{
+    "action": "brief action name (e.g., 'Remove Liquidity', 'Swap to Stablecoin')",
+    "reasoning": "1-2 sentence explanation",
+    "urgency": "immediate/soon/monitor",
+    "risk_if_ignored": "brief description of risk"
+}}
 
-Keep it concise, actionable, and easy to understand for a non-technical user."""
+Keep it concise and actionable."""
 
         output = replicate_client.run(
             "openai/gpt-4o-mini",
             input={
                 "prompt": prompt,
-                "system_prompt": "You are Jarvis, a concise DeFi risk analyst. Provide brief, actionable summaries in 1 paragraph only.",
-                "max_tokens": 150,
+                "system_prompt": "You are a DeFi risk manager. Always respond with valid JSON only.",
+                "max_tokens": 200,
+                "temperature": 0.3
+            }
+        )
+        
+        response_text = "".join(output).strip()
+        # Try to parse JSON from response
+        try:
+            return json.loads(response_text)
+        except:
+            # Fallback if JSON parsing fails
+            return {
+                "action": "Review Portfolio",
+                "reasoning": "Anomaly detected, manual review recommended",
+                "urgency": "soon",
+                "risk_if_ignored": "Potential losses may increase"
+            }
+            
+    except Exception as e:
+        print(f"AI Decision Error: {e}")
+        return {
+            "action": "Monitor Situation",
+            "reasoning": f"{alert.severity} alert triggered",
+            "urgency": "immediate" if alert.severity == Severity.CRITICAL else "soon",
+            "risk_if_ignored": "Situation may worsen"
+        }
+
+async def generate_ai_summary(alert: RiskAlert, context: dict) -> str:
+    """Generate AI summary of the alert"""
+    try:
+        if alert.alertType.startswith("wallet_"):
+            prompt = f"""Analyze this wallet alert briefly (2-3 sentences):
+Severity: {alert.severity}
+Message: {alert.message}
+Context: Wallet {context.get('address', 'N/A')}, Value: ${context.get('totalValue', 0):.2f}
+Metrics: {alert.metrics}"""
+        else:
+            prompt = f"""Analyze this pool alert briefly (2-3 sentences):
+Severity: {alert.severity}
+Message: {alert.message}
+TVL: ${context.get('tvl', 0):.2f}, Ratio: {context.get('ratio', 0):.4f}
+Metrics: {alert.metrics}"""
+
+        output = replicate_client.run(
+            "openai/gpt-4o-mini",
+            input={
+                "prompt": prompt,
+                "system_prompt": "You are Jarvis. Provide brief, clear DeFi risk analysis.",
+                "max_tokens": 100,
                 "temperature": 0.7
             }
         )
@@ -398,9 +588,83 @@ Keep it concise, actionable, and easy to understand for a non-technical user."""
         return "".join(output).strip()
     except Exception as e:
         print(f"AI Summary Error: {e}")
-        return f"{alert.severity} Alert: {alert.message}. Monitor closely and consider reviewing your position."
+        return f"{alert.severity} Alert: {alert.message}"
 
+# ============================
+# TELEGRAM FUNCTIONS
+# ============================
+async def send_telegram_message(telegram_id: int, message: str, 
+                                reply_markup: dict = None) -> Optional[int]:
+    """Send message to telegram user"""
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "chat_id": telegram_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+                
+            response = await client.post(
+                f"{TELEGRAM_API_URL}/sendMessage",
+                json=payload
+            )
+            result = response.json()
+            if result.get("ok"):
+                return result["result"]["message_id"]
+            else:
+                print(f"Telegram error: {result}")
+                return None
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+        return None
+
+async def send_action_request(telegram_id: int, action_id: int, 
+                              alert: RiskAlert, action_decision: dict, 
+                              ai_summary: str) -> bool:
+    """Send action permission request to Telegram"""
+    
+    emoji_map = {
+        "CRITICAL": "🚨",
+        "HIGH": "⚠️",
+        "MEDIUM": "⚡",
+        "LOW": "ℹ️"
+    }
+    
+    message = f"""{emoji_map.get(alert.severity, '🔔')} <b>JARVIS ALERT</b>
+
+<b>Severity:</b> {alert.severity}
+<b>Alert:</b> {alert.message}
+
+<b>AI Analysis:</b>
+{ai_summary}
+
+<b>📋 Recommended Action:</b>
+<b>{action_decision['action']}</b>
+
+<b>Reasoning:</b> {action_decision['reasoning']}
+<b>Urgency:</b> {action_decision['urgency'].upper()}
+<b>Risk if ignored:</b> {action_decision['risk_if_ignored']}
+
+<b>Should I execute this action?</b>
+Reply: /yes_{action_id} or /no_{action_id}"""
+
+    inline_keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Yes, Execute", "callback_data": f"yes_{action_id}"},
+            {"text": "❌ No, Cancel", "callback_data": f"no_{action_id}"}
+        ]]
+    }
+    
+    message_id = await send_telegram_message(telegram_id, message, inline_keyboard)
+    return message_id is not None
+
+# ============================
+# COMMUNICATION
+# ============================
 async def make_phone_call(alert: RiskAlert, ai_summary: str) -> dict:
+    """Make phone call via Twilio"""
     try:
         call_message = f"Alert! {alert.severity} severity. {alert.message}. {ai_summary}"
         
@@ -416,19 +680,78 @@ async def make_phone_call(alert: RiskAlert, ai_summary: str) -> dict:
             }
         )
         
-        return {
-            "success": True,
-            "executionSid": execution.sid,
-            "status": execution.status
-        }
+        return {"success": True, "executionSid": execution.sid}
     except Exception as e:
         print(f"Phone call error: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
+
+async def process_alert_with_action(alert: RiskAlert, context: dict, 
+                                    telegram_id: int = None, 
+                                    make_call: bool = True) -> AlertResponse:
+    """Process alert, generate AI decision, and request permission"""
+    
+    # Generate AI summary
+    ai_summary = await generate_ai_summary(alert, context)
+    
+    # Generate action decision
+    action_decision = await generate_action_decision(alert, context)
+    
+    # Make phone call if requested
+    call_initiated = False
+    if make_call:
+        call_result = await make_phone_call(alert, ai_summary)
+        call_initiated = call_result["success"]
+    
+    # Send to Telegram if user is registered
+    telegram_sent = False
+    if telegram_id:
+        user = get_user_by_telegram_id(telegram_id)
+        if user:
+            # Save action to database
+            action_id = save_action(
+                user_id=user['user_id'],
+                alert_type=alert.alertType,
+                severity=alert.severity,
+                alert_message=alert.message,
+                proposed_action=action_decision['action'],
+                action_details=action_decision
+            )
+            
+            # Send action request to Telegram
+            telegram_sent = await send_action_request(
+                telegram_id, action_id, alert, action_decision, ai_summary
+            )
+            
+            # Save alert history
+            save_alert_history(
+                user_id=user['user_id'],
+                wallet_address=context.get('address', ''),
+                alert_type=alert.alertType,
+                severity=alert.severity,
+                message=alert.message,
+                metrics=alert.metrics,
+                ai_summary=ai_summary,
+                call_initiated=call_initiated,
+                telegram_sent=telegram_sent
+            )
+            
+            # Store pending action
+            pending_actions[action_id] = {
+                'alert': alert,
+                'action': action_decision,
+                'context': context
+            }
+    
+    return AlertResponse(
+        alert=alert,
+        aiSummary=ai_summary,
+        proposedAction=json.dumps(action_decision),
+        callInitiated=call_initiated,
+        telegramSent=telegram_sent
+    )
 
 def generate_fake_alert(alert_type: str) -> RiskAlert:
+    """Generate fake alert for testing"""
     fake_alerts = {
         "tvl-drop": RiskAlert(
             severity=Severity.CRITICAL,
@@ -442,16 +765,10 @@ def generate_fake_alert(alert_type: str) -> RiskAlert:
             metrics={"reserveImbalance": 35.8},
             alertType="pool_imbalance"
         ),
-        "whale": RiskAlert(
-            severity=Severity.CRITICAL,
-            message="Large whale transaction detected: $500K liquidity removed",
-            metrics={"tvlChange": -45.2},
-            alertType="whale_movement"
-        ),
         "rug-pull": RiskAlert(
             severity=Severity.CRITICAL,
-            message="Potential rug pull: Portfolio value dropped 45% in 5 minutes",
-            metrics={"valueChange": -45, "timeframe": "5min"},
+            message="Portfolio value dropped 45% - Potential rug pull",
+            metrics={"valueChange": -45},
             alertType="wallet_value_drop"
         )
     }
@@ -461,6 +778,7 @@ def generate_fake_alert(alert_type: str) -> RiskAlert:
 # BACKGROUND MONITORING
 # ============================
 async def monitor_loop():
+    """Background monitoring loop"""
     global monitoring_active, pool_history, wallet_portfolios
     
     while monitoring_active:
@@ -470,11 +788,20 @@ async def monitor_loop():
             pool_alert = detect_pool_anomalies(current_pool, pool_history)
             
             if pool_alert:
-                ai_summary = await generate_ai_summary(pool_alert, {
-                    "tvl": current_pool.tvl,
-                    "ratio": current_pool.ratio
-                })
-                await make_phone_call(pool_alert, ai_summary)
+                # Find users with telegram IDs to notify
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL")
+                    telegram_users = [row['telegram_id'] for row in cursor.fetchall()]
+                
+                for tg_id in telegram_users:
+                    await process_alert_with_action(
+                        pool_alert,
+                        {"tvl": current_pool.tvl, "ratio": current_pool.ratio},
+                        telegram_id=tg_id,
+                        make_call=True
+                    )
+                
                 print(f"🚨 Pool Alert: {pool_alert.severity} - {pool_alert.message}")
             
             pool_history.append(current_pool)
@@ -492,11 +819,23 @@ async def monitor_loop():
                     wallet_alert = detect_wallet_risks(current_portfolio, wallet_portfolios[wallet_addr])
                     
                     if wallet_alert:
-                        ai_summary = await generate_ai_summary(wallet_alert, {
-                            "address": wallet_addr,
-                            "totalValue": current_portfolio.totalValueUSD
-                        })
-                        await make_phone_call(wallet_alert, ai_summary)
+                        # Find telegram user for this wallet
+                        with get_db() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT telegram_id FROM users WHERE wallet_address = ?",
+                                (wallet_addr,)
+                            )
+                            result = cursor.fetchone()
+                            tg_id = result['telegram_id'] if result else None
+                        
+                        await process_alert_with_action(
+                            wallet_alert,
+                            {"address": wallet_addr, "totalValue": current_portfolio.totalValueUSD},
+                            telegram_id=tg_id,
+                            make_call=True
+                        )
+                        
                         print(f"🚨 Wallet Alert: {wallet_alert.severity} - {wallet_alert.message}")
                     
                     wallet_portfolios[wallet_addr].append(current_portfolio)
@@ -512,46 +851,285 @@ async def monitor_loop():
             await asyncio.sleep(60)
 
 # ============================
-# ENDPOINTS
+# TELEGRAM WEBHOOK HANDLER
+# ============================
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: dict):
+    """Handle Telegram webhook updates"""
+    try:
+        if "callback_query" in request:
+            # Handle button callbacks
+            callback = request["callback_query"]
+            telegram_id = callback["from"]["id"]
+            data = callback["data"]  # e.g., "yes_123" or "no_123"
+            
+            # Parse action_id and response
+            parts = data.split("_")
+            if len(parts) == 2:
+                response = parts[0]  # "yes" or "no"
+                action_id = int(parts[1])
+                
+                # Update action in database
+                update_action_response(action_id, response)
+                
+                # Get action details
+                if action_id in pending_actions:
+                    action_info = pending_actions[action_id]
+                    
+                    if response == "yes":
+                        # Execute the action (placeholder - implement actual execution)
+                        await send_telegram_message(
+                            telegram_id,
+                            f"✅ Action approved! Executing: {action_info['action']['action']}\n\n"
+                            f"Note: Actual blockchain execution would happen here."
+                        )
+                        mark_action_executed(action_id)
+                    else:
+                        await send_telegram_message(
+                            telegram_id,
+                            f"❌ Action cancelled. Your portfolio remains unchanged.\n\n"
+                            f"I'll continue monitoring for further alerts."
+                        )
+                    
+                    # Remove from pending
+                    del pending_actions[action_id]
+                
+                # Answer callback to remove loading state
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{TELEGRAM_API_URL}/answerCallbackQuery",
+                        json={"callback_query_id": callback["id"]}
+                    )
+        
+        elif "message" in request:
+            # Handle text commands
+            message = request["message"]
+            telegram_id = message["from"]["id"]
+            text = message.get("text", "")
+            
+            # Handle /start command
+            if text.startswith("/start"):
+                username = message["from"].get("username")
+                register_telegram_user(telegram_id, username)
+                
+                welcome_msg = """👋 Welcome to <b>JARVIS on Celo</b>!
+
+I'm your AI-powered DeFi portfolio guardian. I'll monitor your assets 24/7 and alert you to potential risks.
+
+<b>Commands:</b>
+/help - Show available commands
+/wallet [address] - Link your wallet
+/status - Check monitoring status
+/history - View recent alerts
+
+Ready to protect your portfolio? 🛡️"""
+                
+                await send_telegram_message(telegram_id, welcome_msg)
+            
+            # Handle /help command
+            elif text.startswith("/help"):
+                help_msg = """<b>📖 JARVIS Commands</b>
+
+/wallet [address] - Link your Celo wallet
+/status - Check what I'm monitoring
+/history - View your alert history
+/actions - See pending actions
+/stop - Pause monitoring
+
+When I detect risks, I'll:
+1. 🤖 Analyze the situation with AI
+2. 📞 Call you immediately
+3. 💬 Send details here
+4. 🎯 Recommend an action
+5. ⏳ Wait for your approval
+
+Stay safe! 🛡️"""
+                await send_telegram_message(telegram_id, help_msg)
+            
+            # Handle /wallet command
+            elif text.startswith("/wallet"):
+                parts = text.split()
+                if len(parts) >= 2:
+                    wallet_address = parts[1].lower()
+                    user_id = register_telegram_user(telegram_id, wallet_address=wallet_address)
+                    monitored_wallets.add(wallet_address)
+                    
+                    # Get initial portfolio
+                    portfolio = await get_wallet_portfolio(wallet_address)
+                    
+                    msg = f"""✅ <b>Wallet Linked Successfully!</b>
+
+<b>Address:</b> <code>{wallet_address[:10]}...{wallet_address[-8:]}</code>
+
+<b>Portfolio Value:</b> ${portfolio.totalValueUSD:.2f}
+<b>CELO:</b> {int(portfolio.celoBalance) / 1e18:.4f} CELO
+<b>cUSD:</b> {int(portfolio.cUSDBalance) / 1e18:.2f} cUSD
+
+I'm now monitoring this wallet 24/7! 👀"""
+                    
+                    await send_telegram_message(telegram_id, msg)
+                else:
+                    await send_telegram_message(
+                        telegram_id,
+                        "Please provide a wallet address:\n/wallet 0x..."
+                    )
+            
+            # Handle /status command
+            elif text.startswith("/status"):
+                user = get_user_by_telegram_id(telegram_id)
+                if user and user['wallet_address']:
+                    portfolio = await get_wallet_portfolio(user['wallet_address'])
+                    
+                    status_msg = f"""📊 <b>Monitoring Status</b>
+
+<b>Wallet:</b> <code>{user['wallet_address'][:10]}...{user['wallet_address'][-8:]}</code>
+<b>Total Value:</b> ${portfolio.totalValueUSD:.2f}
+<b>Positions:</b> {len(portfolio.positions)}
+
+<b>Active Monitoring:</b> {'✅ ON' if monitoring_active else '⏸️ PAUSED'}
+
+Everything looks good! 👍"""
+                    
+                    await send_telegram_message(telegram_id, status_msg)
+                else:
+                    await send_telegram_message(
+                        telegram_id,
+                        "No wallet linked yet. Use /wallet [address] to get started!"
+                    )
+            
+            # Handle /history command
+            elif text.startswith("/history"):
+                user = get_user_by_telegram_id(telegram_id)
+                if user:
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT alert_type, severity, message, created_at 
+                            FROM alert_history 
+                            WHERE user_id = ? 
+                            ORDER BY created_at DESC 
+                            LIMIT 5
+                        """, (user['user_id'],))
+                        alerts = cursor.fetchall()
+                    
+                    if alerts:
+                        history_msg = "<b>📜 Recent Alerts</b>\n\n"
+                        for alert in alerts:
+                            emoji = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "⚡", "LOW": "ℹ️"}
+                            history_msg += f"{emoji.get(alert['severity'], '🔔')} <b>{alert['severity']}</b>\n"
+                            history_msg += f"{alert['message']}\n"
+                            history_msg += f"<i>{alert['created_at']}</i>\n\n"
+                        
+                        await send_telegram_message(telegram_id, history_msg)
+                    else:
+                        await send_telegram_message(telegram_id, "No alerts yet. That's good news! ✨")
+                else:
+                    await send_telegram_message(telegram_id, "Please use /start first!")
+            
+            # Handle /actions command
+            elif text.startswith("/actions"):
+                user = get_user_by_telegram_id(telegram_id)
+                if user:
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT action_id, proposed_action, status, created_at
+                            FROM actions 
+                            WHERE user_id = ? AND status = 'pending'
+                            ORDER BY created_at DESC
+                        """, (user['user_id'],))
+                        actions = cursor.fetchall()
+                    
+                    if actions:
+                        actions_msg = "<b>⏳ Pending Actions</b>\n\n"
+                        for action in actions:
+                            actions_msg += f"<b>#{action['action_id']}</b>: {action['proposed_action']}\n"
+                            actions_msg += f"/yes_{action['action_id']} or /no_{action['action_id']}\n\n"
+                        
+                        await send_telegram_message(telegram_id, actions_msg)
+                    else:
+                        await send_telegram_message(telegram_id, "No pending actions. All clear! ✅")
+                else:
+                    await send_telegram_message(telegram_id, "Please use /start first!")
+        
+        return {"ok": True}
+    
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return {"ok": False, "error": str(e)}
+
+# ============================
+# API ENDPOINTS
 # ============================
 @app.get("/")
 async def root():
     return {
-        "message": "Jarvis on Celo - AI Portfolio Guardian",
+        "message": "Jarvis on Celo - AI Portfolio Guardian v3.0",
         "status": "running",
-        "features": ["Pool Monitoring", "Wallet Monitoring", "AI Risk Analysis", "Phone Alerts"]
+        "features": [
+            "Pool Monitoring",
+            "Wallet Monitoring", 
+            "AI Risk Analysis",
+            "Phone Alerts",
+            "Telegram Integration",
+            "Action Permission System"
+        ]
     }
+
+@app.post("/users/register")
+async def register_user(request: TelegramUserRegister):
+    """Register a new Telegram user"""
+    user_id = register_telegram_user(
+        telegram_id=request.telegram_id,
+        username=request.username,
+        wallet_address=request.wallet_address,
+        phone_number=request.phone_number
+    )
+    
+    if request.wallet_address:
+        monitored_wallets.add(request.wallet_address.lower())
+    
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "telegram_id": request.telegram_id
+    }
+
+@app.get("/users/{telegram_id}")
+async def get_user(telegram_id: int):
+    """Get user information"""
+    user = get_user_by_telegram_id(telegram_id)
+    if user:
+        return user
+    return {"error": "User not found"}
 
 @app.get("/pool")
 async def get_pool():
+    """Get current pool data"""
     return await get_pool_data()
 
 @app.get("/check")
 async def check_pool():
+    """Check pool and trigger alerts if needed"""
     current_data = await get_pool_data()
     pool_history.append(current_data)
     
     alert = detect_pool_anomalies(current_data, pool_history)
-    ai_summary = None
-    call_initiated = False
     
     if alert:
-        ai_summary = await generate_ai_summary(alert, {
-            "tvl": current_data.tvl,
-            "ratio": current_data.ratio
-        })
-        call_result = await make_phone_call(alert, ai_summary)
-        call_initiated = call_result["success"]
+        response = await process_alert_with_action(
+            alert,
+            {"tvl": current_data.tvl, "ratio": current_data.ratio},
+            telegram_id=None,
+            make_call=True
+        )
+        response.pool = current_data
+        return response
     
     if len(pool_history) > 100:
         pool_history.pop(0)
     
-    return AlertResponse(
-        pool=current_data,
-        alert=alert,
-        aiSummary=ai_summary,
-        callInitiated=call_initiated
-    )
+    return AlertResponse(pool=current_data)
 
 @app.post("/wallet/analyze")
 async def analyze_wallet(request: WalletMonitorRequest):
@@ -565,27 +1143,27 @@ async def analyze_wallet(request: WalletMonitorRequest):
             wallet_portfolios[wallet_address] = []
         
         alert = detect_wallet_risks(portfolio, wallet_portfolios[wallet_address])
-        ai_summary = None
-        call_initiated = False
         
         if alert:
-            ai_summary = await generate_ai_summary(alert, {
-                "address": wallet_address,
-                "totalValue": portfolio.totalValueUSD
-            })
-            call_result = await make_phone_call(alert, ai_summary)
-            call_initiated = call_result["success"]
+            response = await process_alert_with_action(
+                alert,
+                {"address": wallet_address, "totalValue": portfolio.totalValueUSD},
+                telegram_id=request.telegramUserId,
+                make_call=True
+            )
+            response.wallet = portfolio
+            
+            wallet_portfolios[wallet_address].append(portfolio)
+            if len(wallet_portfolios[wallet_address]) > 50:
+                wallet_portfolios[wallet_address].pop(0)
+            
+            return response
         
         wallet_portfolios[wallet_address].append(portfolio)
         if len(wallet_portfolios[wallet_address]) > 50:
             wallet_portfolios[wallet_address].pop(0)
         
-        return AlertResponse(
-            wallet=portfolio,
-            alert=alert,
-            aiSummary=ai_summary,
-            callInitiated=call_initiated
-        )
+        return AlertResponse(wallet=portfolio)
     except Exception as e:
         return {"error": str(e)}
 
@@ -595,10 +1173,12 @@ async def add_wallet_monitoring(request: WalletMonitorRequest):
     wallet_address = request.walletAddress.lower()
     monitored_wallets.add(wallet_address)
     
-    # Initialize wallet history
     if wallet_address not in wallet_portfolios:
         portfolio = await get_wallet_portfolio(wallet_address)
         wallet_portfolios[wallet_address] = [portfolio]
+    
+    if request.telegramUserId:
+        register_telegram_user(request.telegramUserId, wallet_address=wallet_address)
     
     return {
         "status": "added",
@@ -626,29 +1206,83 @@ async def get_monitored_wallets():
         "count": len(monitored_wallets)
     }
 
+@app.post("/actions/{action_id}/respond")
+async def respond_to_action(action_id: int, response: ActionResponse):
+    """User responds to an action (yes/no)"""
+    update_action_response(action_id, response.response)
+    
+    if action_id in pending_actions:
+        action_info = pending_actions[action_id]
+        
+        if response.response.lower() == "yes":
+            # Here you would implement actual blockchain execution
+            # For now, just mark as executed
+            mark_action_executed(action_id)
+            
+            return {
+                "status": "approved",
+                "action": action_info['action']['action'],
+                "message": "Action will be executed"
+            }
+        else:
+            return {
+                "status": "rejected",
+                "message": "Action cancelled"
+            }
+    
+    return {"error": "Action not found"}
+
+@app.get("/actions/pending")
+async def get_pending_actions():
+    """Get all pending actions"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.*, u.telegram_id, u.username 
+            FROM actions a
+            JOIN users u ON a.user_id = u.user_id
+            WHERE a.status = 'pending'
+            ORDER BY a.created_at DESC
+        """)
+        actions = [dict(row) for row in cursor.fetchall()]
+    
+    return {"pending_actions": actions, "count": len(actions)}
+
+@app.get("/actions/history")
+async def get_actions_history():
+    """Get action history"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.*, u.telegram_id, u.username 
+            FROM actions a
+            JOIN users u ON a.user_id = u.user_id
+            ORDER BY a.created_at DESC
+            LIMIT 50
+        """)
+        actions = [dict(row) for row in cursor.fetchall()]
+    
+    return {"actions": actions, "count": len(actions)}
+
 @app.post("/test-alert")
 async def test_alert(request: TestAlertRequest):
+    """Test alert system with fake data"""
     current_data = await get_pool_data()
     fake_alert = generate_fake_alert(request.alertType)
-    ai_summary = await generate_ai_summary(fake_alert, {
-        "tvl": current_data.tvl,
-        "ratio": current_data.ratio
-    })
     
-    call_initiated = False
-    if request.phoneCall:
-        call_result = await make_phone_call(fake_alert, ai_summary)
-        call_initiated = call_result["success"]
-    
-    return AlertResponse(
-        pool=current_data,
-        alert=fake_alert,
-        aiSummary=ai_summary,
-        callInitiated=call_initiated
+    response = await process_alert_with_action(
+        fake_alert,
+        {"tvl": current_data.tvl, "ratio": current_data.ratio},
+        telegram_id=request.telegramUserId,
+        make_call=request.phoneCall
     )
+    
+    response.pool = current_data
+    return response
 
 @app.post("/monitor/start")
 async def start_monitoring(background_tasks: BackgroundTasks):
+    """Start background monitoring"""
     global monitoring_active
     
     if monitoring_active:
@@ -661,19 +1295,26 @@ async def start_monitoring(background_tasks: BackgroundTasks):
 
 @app.post("/monitor/stop")
 async def stop_monitoring():
+    """Stop background monitoring"""
     global monitoring_active
     monitoring_active = False
     return {"status": "stopped"}
 
 @app.get("/status")
 async def monitoring_status():
+    """Get monitoring status"""
     return {
         "monitoring": monitoring_active,
         "pool_history": len(pool_history),
         "monitored_wallets": len(monitored_wallets),
-        "wallets": list(monitored_wallets)
+        "wallets": list(monitored_wallets),
+        "pending_actions": len(pending_actions),
+        "registered_users": len(list(get_db().__enter__().execute("SELECT COUNT(*) FROM users").fetchone()))
     }
 
 if __name__ == "__main__":
     import uvicorn
+    print("🚀 Starting Jarvis on Celo v3.0...")
+    print("📱 Telegram Bot Token configured")
+    print("🗄️ Database initialized")
     uvicorn.run(app, host="0.0.0.0", port=8000)
