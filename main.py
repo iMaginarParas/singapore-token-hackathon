@@ -1,4 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware  # ADD THIS
 from pydantic import BaseModel
 from typing import Optional, List
 import httpx
@@ -29,6 +30,17 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 app = FastAPI(title="CELO Pool Risk Monitor", version="1.0.0")
+
+# ============================
+# CORS MIDDLEWARE - ADD THIS SECTION
+# ============================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================
 # MODELS
