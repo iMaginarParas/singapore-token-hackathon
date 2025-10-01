@@ -16,7 +16,6 @@ import json
 # ============================
 # CONFIGURATION
 # ============================
-UBESWAP_CELO_cUSD_POOL = "0x1e593f1fe7b61c53874b54ec0c59fd0d5eb8621e"
 CELO_PRICE = 0.7
 CELO_RPC_URL = "https://forno.celo.org"
 
@@ -64,6 +63,7 @@ def init_database():
             username TEXT,
             wallet_address TEXT,
             phone_number TEXT,
+            monitored_pool_address TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -95,6 +95,7 @@ def init_database():
             alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             wallet_address TEXT,
+            pool_address TEXT,
             alert_type TEXT NOT NULL,
             severity TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -144,6 +145,7 @@ class Severity(str, Enum):
     CRITICAL = "CRITICAL"
 
 class PoolData(BaseModel):
+    pool_address: str
     reserve0: str
     reserve1: str
     tvl: float
@@ -191,9 +193,14 @@ class TestAlertRequest(BaseModel):
     alertType: str
     phoneCall: bool = True
     telegramUserId: Optional[int] = None
+    poolAddress: Optional[str] = None
 
 class WalletMonitorRequest(BaseModel):
     walletAddress: str
+    telegramUserId: Optional[int] = None
+
+class PoolMonitorRequest(BaseModel):
+    poolAddress: str
     telegramUserId: Optional[int] = None
 
 class TelegramUserRegister(BaseModel):
@@ -201,6 +208,7 @@ class TelegramUserRegister(BaseModel):
     username: Optional[str] = None
     wallet_address: Optional[str] = None
     phone_number: Optional[str] = None
+    pool_address: Optional[str] = None
 
 class ActionResponse(BaseModel):
     action_id: int
@@ -209,10 +217,11 @@ class ActionResponse(BaseModel):
 # ============================
 # STORAGE
 # ============================
-pool_history: List[PoolData] = []
+pool_history: Dict[str, List[PoolData]] = {}  # pool_address -> history
 wallet_portfolios: Dict[str, List[WalletPortfolio]] = {}
 monitoring_active = False
 monitored_wallets: set = set()
+monitored_pools: set = set()
 pending_actions: Dict[int, dict] = {}  # action_id -> action details
 
 # ============================
@@ -227,19 +236,21 @@ def get_user_by_telegram_id(telegram_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 def register_telegram_user(telegram_id: int, username: str = None, 
-                          wallet_address: str = None, phone_number: str = None) -> int:
+                          wallet_address: str = None, phone_number: str = None,
+                          pool_address: str = None) -> int:
     """Register or update telegram user"""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO users (telegram_id, username, wallet_address, phone_number)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users (telegram_id, username, wallet_address, phone_number, monitored_pool_address)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
                 username = COALESCE(excluded.username, username),
                 wallet_address = COALESCE(excluded.wallet_address, wallet_address),
                 phone_number = COALESCE(excluded.phone_number, phone_number),
+                monitored_pool_address = COALESCE(excluded.monitored_pool_address, monitored_pool_address),
                 last_active = CURRENT_TIMESTAMP
-        """, (telegram_id, username, wallet_address, phone_number))
+        """, (telegram_id, username, wallet_address, phone_number, pool_address))
         conn.commit()
         cursor.execute("SELECT user_id FROM users WHERE telegram_id = ?", (telegram_id,))
         return cursor.fetchone()[0]
@@ -282,18 +293,18 @@ def mark_action_executed(action_id: int):
         """, (action_id,))
         conn.commit()
 
-def save_alert_history(user_id: int, wallet_address: str, alert_type: str,
-                       severity: str, message: str, metrics: dict,
+def save_alert_history(user_id: int, wallet_address: str, pool_address: str,
+                       alert_type: str, severity: str, message: str, metrics: dict,
                        ai_summary: str, call_initiated: bool, telegram_sent: bool):
     """Save alert to history"""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO alert_history 
-            (user_id, wallet_address, alert_type, severity, message, metrics, 
+            (user_id, wallet_address, pool_address, alert_type, severity, message, metrics, 
              ai_summary, call_initiated, telegram_sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, wallet_address, alert_type, severity, message, 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, wallet_address, pool_address, alert_type, severity, message, 
               json.dumps(metrics), ai_summary, call_initiated, telegram_sent))
         conn.commit()
 
@@ -308,7 +319,8 @@ def decode_reserves(hex_data: str) -> tuple:
     reserve1 = int(reserve1_hex, 16)
     return reserve0, reserve1
 
-async def get_pool_data() -> PoolData:
+async def get_pool_data(pool_address: str) -> PoolData:
+    """Get pool data for a specific pool address"""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             CELO_RPC_URL,
@@ -316,7 +328,7 @@ async def get_pool_data() -> PoolData:
                 "jsonrpc": "2.0",
                 "method": "eth_call",
                 "params": [
-                    {"to": UBESWAP_CELO_cUSD_POOL, "data": "0x0902f1ac"},
+                    {"to": pool_address, "data": "0x0902f1ac"},
                     "latest"
                 ],
                 "id": 1
@@ -330,6 +342,7 @@ async def get_pool_data() -> PoolData:
         ratio = reserve0_formatted / reserve1_formatted
         
         return PoolData(
+            pool_address=pool_address,
             reserve0=str(reserve0),
             reserve1=str(reserve1),
             tvl=tvl,
@@ -371,7 +384,7 @@ async def get_balance(address: str, token: str = None) -> int:
                 return int(data["result"], 16)
             return 0
 
-async def get_wallet_portfolio(wallet_address: str) -> WalletPortfolio:
+async def get_wallet_portfolio(wallet_address: str, lp_pool_address: str = None) -> WalletPortfolio:
     """Fetch complete wallet portfolio from Celo blockchain"""
     celo_balance_wei = await get_balance(wallet_address)
     celo_balance = celo_balance_wei / 1e18
@@ -408,13 +421,14 @@ async def get_wallet_portfolio(wallet_address: str) -> WalletPortfolio:
         ))
     
     positions = []
-    lp_balance = await get_balance(wallet_address, UBESWAP_CELO_cUSD_POOL)
-    if lp_balance > 0:
-        lp_value = (lp_balance / 1e18) * 2
-        positions.append(PositionData(
-            protocol="Ubeswap", type="Liquidity Pool",
-            tokens=["CELO", "cUSD"], value=lp_value, apy=15.5
-        ))
+    if lp_pool_address:
+        lp_balance = await get_balance(wallet_address, lp_pool_address)
+        if lp_balance > 0:
+            lp_value = (lp_balance / 1e18) * 2
+            positions.append(PositionData(
+                protocol="Ubeswap", type="Liquidity Pool",
+                tokens=["CELO", "cUSD"], value=lp_value, apy=15.5
+            ))
     
     return WalletPortfolio(
         address=wallet_address, totalValueUSD=total_value,
@@ -572,6 +586,7 @@ Metrics: {alert.metrics}"""
             prompt = f"""Analyze this pool alert briefly (2-3 sentences):
 Severity: {alert.severity}
 Message: {alert.message}
+Pool: {context.get('pool_address', 'N/A')}
 TVL: ${context.get('tvl', 0):.2f}, Ratio: {context.get('ratio', 0):.4f}
 Metrics: {alert.metrics}"""
 
@@ -726,6 +741,7 @@ async def process_alert_with_action(alert: RiskAlert, context: dict,
             save_alert_history(
                 user_id=user['user_id'],
                 wallet_address=context.get('address', ''),
+                pool_address=context.get('pool_address', ''),
                 alert_type=alert.alertType,
                 severity=alert.severity,
                 message=alert.message,
@@ -783,35 +799,57 @@ async def monitor_loop():
     
     while monitoring_active:
         try:
-            # Monitor pool
-            current_pool = await get_pool_data()
-            pool_alert = detect_pool_anomalies(current_pool, pool_history)
-            
-            if pool_alert:
-                # Find users with telegram IDs to notify
-                with get_db() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL")
-                    telegram_users = [row['telegram_id'] for row in cursor.fetchall()]
-                
-                for tg_id in telegram_users:
-                    await process_alert_with_action(
-                        pool_alert,
-                        {"tvl": current_pool.tvl, "ratio": current_pool.ratio},
-                        telegram_id=tg_id,
-                        make_call=True
-                    )
-                
-                print(f"🚨 Pool Alert: {pool_alert.severity} - {pool_alert.message}")
-            
-            pool_history.append(current_pool)
-            if len(pool_history) > 100:
-                pool_history.pop(0)
+            # Monitor all registered pools
+            for pool_addr in list(monitored_pools):
+                try:
+                    current_pool = await get_pool_data(pool_addr)
+                    
+                    if pool_addr not in pool_history:
+                        pool_history[pool_addr] = []
+                    
+                    pool_alert = detect_pool_anomalies(current_pool, pool_history[pool_addr])
+                    
+                    if pool_alert:
+                        # Find users monitoring this pool
+                        with get_db() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "SELECT telegram_id FROM users WHERE monitored_pool_address = ?",
+                                (pool_addr,)
+                            )
+                            telegram_users = [row['telegram_id'] for row in cursor.fetchall()]
+                        
+                        for tg_id in telegram_users:
+                            await process_alert_with_action(
+                                pool_alert,
+                                {"pool_address": pool_addr, "tvl": current_pool.tvl, "ratio": current_pool.ratio},
+                                telegram_id=tg_id,
+                                make_call=True
+                            )
+                        
+                        print(f"🚨 Pool Alert ({pool_addr[:10]}...): {pool_alert.severity} - {pool_alert.message}")
+                    
+                    pool_history[pool_addr].append(current_pool)
+                    if len(pool_history[pool_addr]) > 100:
+                        pool_history[pool_addr].pop(0)
+                        
+                except Exception as e:
+                    print(f"Error monitoring pool {pool_addr}: {e}")
             
             # Monitor wallets
             for wallet_addr in list(monitored_wallets):
                 try:
-                    current_portfolio = await get_wallet_portfolio(wallet_addr)
+                    # Get user's pool address if they have one
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT monitored_pool_address FROM users WHERE wallet_address = ?",
+                            (wallet_addr,)
+                        )
+                        result = cursor.fetchone()
+                        lp_pool = result['monitored_pool_address'] if result else None
+                    
+                    current_portfolio = await get_wallet_portfolio(wallet_addr, lp_pool)
                     
                     if wallet_addr not in wallet_portfolios:
                         wallet_portfolios[wallet_addr] = []
@@ -919,6 +957,7 @@ I'm your AI-powered DeFi portfolio guardian. I'll monitor your assets 24/7 and a
 <b>Commands:</b>
 /help - Show available commands
 /wallet [address] - Link your wallet
+/pool [address] - Monitor a liquidity pool
 /status - Check monitoring status
 /history - View recent alerts
 
@@ -931,6 +970,7 @@ Ready to protect your portfolio? 🛡️"""
                 help_msg = """<b>📖 JARVIS Commands</b>
 
 /wallet [address] - Link your Celo wallet
+/pool [address] - Monitor a liquidity pool
 /status - Check what I'm monitoring
 /history - View your alert history
 /actions - See pending actions
@@ -951,11 +991,14 @@ Stay safe! 🛡️"""
                 parts = text.split()
                 if len(parts) >= 2:
                     wallet_address = parts[1].lower()
-                    user_id = register_telegram_user(telegram_id, wallet_address=wallet_address)
+                    user = get_user_by_telegram_id(telegram_id)
+                    lp_pool = user['monitored_pool_address'] if user else None
+                    
+                    register_telegram_user(telegram_id, wallet_address=wallet_address)
                     monitored_wallets.add(wallet_address)
                     
                     # Get initial portfolio
-                    portfolio = await get_wallet_portfolio(wallet_address)
+                    portfolio = await get_wallet_portfolio(wallet_address, lp_pool)
                     
                     msg = f"""✅ <b>Wallet Linked Successfully!</b>
 
@@ -974,27 +1017,59 @@ I'm now monitoring this wallet 24/7! 👀"""
                         "Please provide a wallet address:\n/wallet 0x..."
                     )
             
+            # Handle /pool command
+            elif text.startswith("/pool"):
+                parts = text.split()
+                if len(parts) >= 2:
+                    pool_address = parts[1].lower()
+                    register_telegram_user(telegram_id, pool_address=pool_address)
+                    monitored_pools.add(pool_address)
+                    
+                    # Get initial pool data
+                    pool_data = await get_pool_data(pool_address)
+                    
+                    msg = f"""✅ <b>Pool Monitoring Active!</b>
+
+<b>Pool Address:</b> <code>{pool_address[:10]}...{pool_address[-8:]}</code>
+
+<b>Current TVL:</b> ${pool_data.tvl:.2f}
+<b>Reserve Ratio:</b> {pool_data.ratio:.4f}
+
+I'm now monitoring this pool 24/7! 👀"""
+                    
+                    await send_telegram_message(telegram_id, msg)
+                else:
+                    await send_telegram_message(
+                        telegram_id,
+                        "Please provide a pool address:\n/pool 0x..."
+                    )
+            
             # Handle /status command
             elif text.startswith("/status"):
                 user = get_user_by_telegram_id(telegram_id)
-                if user and user['wallet_address']:
-                    portfolio = await get_wallet_portfolio(user['wallet_address'])
+                if user:
+                    status_msg = "<b>📊 Monitoring Status</b>\n\n"
                     
-                    status_msg = f"""📊 <b>Monitoring Status</b>
-
-<b>Wallet:</b> <code>{user['wallet_address'][:10]}...{user['wallet_address'][-8:]}</code>
-<b>Total Value:</b> ${portfolio.totalValueUSD:.2f}
-<b>Positions:</b> {len(portfolio.positions)}
-
-<b>Active Monitoring:</b> {'✅ ON' if monitoring_active else '⏸️ PAUSED'}
-
-Everything looks good! 👍"""
+                    if user['wallet_address']:
+                        lp_pool = user['monitored_pool_address']
+                        portfolio = await get_wallet_portfolio(user['wallet_address'], lp_pool)
+                        status_msg += f"<b>Wallet:</b> <code>{user['wallet_address'][:10]}...{user['wallet_address'][-8:]}</code>\n"
+                        status_msg += f"<b>Total Value:</b> ${portfolio.totalValueUSD:.2f}\n"
+                        status_msg += f"<b>Positions:</b> {len(portfolio.positions)}\n\n"
+                    
+                    if user['monitored_pool_address']:
+                        pool_data = await get_pool_data(user['monitored_pool_address'])
+                        status_msg += f"<b>Pool:</b> <code>{user['monitored_pool_address'][:10]}...{user['monitored_pool_address'][-8:]}</code>\n"
+                        status_msg += f"<b>Pool TVL:</b> ${pool_data.tvl:.2f}\n\n"
+                    
+                    status_msg += f"<b>Active Monitoring:</b> {'✅ ON' if monitoring_active else '⏸️ PAUSED'}\n\n"
+                    status_msg += "Everything looks good! 👍"
                     
                     await send_telegram_message(telegram_id, status_msg)
                 else:
                     await send_telegram_message(
                         telegram_id,
-                        "No wallet linked yet. Use /wallet [address] to get started!"
+                        "No wallet or pool linked yet. Use /wallet [address] or /pool [address] to get started!"
                     )
             
             # Handle /history command
@@ -1067,7 +1142,7 @@ async def root():
         "message": "Jarvis on Celo - AI Portfolio Guardian v3.0",
         "status": "running",
         "features": [
-            "Pool Monitoring",
+            "Pool Monitoring (Configurable)",
             "Wallet Monitoring", 
             "AI Risk Analysis",
             "Phone Alerts",
@@ -1083,11 +1158,15 @@ async def register_user(request: TelegramUserRegister):
         telegram_id=request.telegram_id,
         username=request.username,
         wallet_address=request.wallet_address,
-        phone_number=request.phone_number
+        phone_number=request.phone_number,
+        pool_address=request.pool_address
     )
     
     if request.wallet_address:
         monitored_wallets.add(request.wallet_address.lower())
+    
+    if request.pool_address:
+        monitored_pools.add(request.pool_address.lower())
     
     return {
         "status": "success",
@@ -1103,33 +1182,83 @@ async def get_user(telegram_id: int):
         return user
     return {"error": "User not found"}
 
-@app.get("/pool")
-async def get_pool():
-    """Get current pool data"""
-    return await get_pool_data()
+@app.post("/pool/data")
+async def get_pool_endpoint(request: PoolMonitorRequest):
+    """Get current pool data for a specific pool"""
+    pool_address = request.poolAddress.lower()
+    pool_data = await get_pool_data(pool_address)
+    return pool_data
 
-@app.get("/check")
-async def check_pool():
+@app.post("/pool/check")
+async def check_pool_endpoint(request: PoolMonitorRequest):
     """Check pool and trigger alerts if needed"""
-    current_data = await get_pool_data()
-    pool_history.append(current_data)
+    pool_address = request.poolAddress.lower()
+    current_data = await get_pool_data(pool_address)
     
-    alert = detect_pool_anomalies(current_data, pool_history)
+    if pool_address not in pool_history:
+        pool_history[pool_address] = []
+    
+    pool_history[pool_address].append(current_data)
+    
+    alert = detect_pool_anomalies(current_data, pool_history[pool_address])
     
     if alert:
         response = await process_alert_with_action(
             alert,
-            {"tvl": current_data.tvl, "ratio": current_data.ratio},
-            telegram_id=None,
+            {"pool_address": pool_address, "tvl": current_data.tvl, "ratio": current_data.ratio},
+            telegram_id=request.telegramUserId,
             make_call=True
         )
         response.pool = current_data
+        
+        if len(pool_history[pool_address]) > 100:
+            pool_history[pool_address].pop(0)
+        
         return response
     
-    if len(pool_history) > 100:
-        pool_history.pop(0)
+    if len(pool_history[pool_address]) > 100:
+        pool_history[pool_address].pop(0)
     
     return AlertResponse(pool=current_data)
+
+@app.post("/pool/monitor/add")
+async def add_pool_monitoring(request: PoolMonitorRequest):
+    """Add pool to continuous monitoring"""
+    pool_address = request.poolAddress.lower()
+    monitored_pools.add(pool_address)
+    
+    if pool_address not in pool_history:
+        pool_data = await get_pool_data(pool_address)
+        pool_history[pool_address] = [pool_data]
+    
+    if request.telegramUserId:
+        register_telegram_user(request.telegramUserId, pool_address=pool_address)
+    
+    return {
+        "status": "added",
+        "pool": pool_address,
+        "monitored_pools": len(monitored_pools)
+    }
+
+@app.post("/pool/monitor/remove")
+async def remove_pool_monitoring(request: PoolMonitorRequest):
+    """Remove pool from monitoring"""
+    pool_address = request.poolAddress.lower()
+    monitored_pools.discard(pool_address)
+    
+    return {
+        "status": "removed",
+        "pool": pool_address,
+        "monitored_pools": len(monitored_pools)
+    }
+
+@app.get("/pool/monitored")
+async def get_monitored_pools():
+    """Get list of monitored pools"""
+    return {
+        "pools": list(monitored_pools),
+        "count": len(monitored_pools)
+    }
 
 @app.post("/wallet/analyze")
 async def analyze_wallet(request: WalletMonitorRequest):
@@ -1137,7 +1266,14 @@ async def analyze_wallet(request: WalletMonitorRequest):
     wallet_address = request.walletAddress.lower()
     
     try:
-        portfolio = await get_wallet_portfolio(wallet_address)
+        # Get user's pool address if they have one
+        lp_pool = None
+        if request.telegramUserId:
+            user = get_user_by_telegram_id(request.telegramUserId)
+            if user:
+                lp_pool = user['monitored_pool_address']
+        
+        portfolio = await get_wallet_portfolio(wallet_address, lp_pool)
         
         if wallet_address not in wallet_portfolios:
             wallet_portfolios[wallet_address] = []
@@ -1173,8 +1309,15 @@ async def add_wallet_monitoring(request: WalletMonitorRequest):
     wallet_address = request.walletAddress.lower()
     monitored_wallets.add(wallet_address)
     
+    # Get user's pool address if they have one
+    lp_pool = None
+    if request.telegramUserId:
+        user = get_user_by_telegram_id(request.telegramUserId)
+        if user:
+            lp_pool = user['monitored_pool_address']
+    
     if wallet_address not in wallet_portfolios:
-        portfolio = await get_wallet_portfolio(wallet_address)
+        portfolio = await get_wallet_portfolio(wallet_address, lp_pool)
         wallet_portfolios[wallet_address] = [portfolio]
     
     if request.telegramUserId:
@@ -1267,12 +1410,13 @@ async def get_actions_history():
 @app.post("/test-alert")
 async def test_alert(request: TestAlertRequest):
     """Test alert system with fake data"""
-    current_data = await get_pool_data()
+    pool_address = request.poolAddress or "0x1e593f1fe7b61c53874b54ec0c59fd0d5eb8621e"
+    current_data = await get_pool_data(pool_address)
     fake_alert = generate_fake_alert(request.alertType)
     
     response = await process_alert_with_action(
         fake_alert,
-        {"tvl": current_data.tvl, "ratio": current_data.ratio},
+        {"pool_address": pool_address, "tvl": current_data.tvl, "ratio": current_data.ratio},
         telegram_id=request.telegramUserId,
         make_call=request.phoneCall
     )
@@ -1303,13 +1447,20 @@ async def stop_monitoring():
 @app.get("/status")
 async def monitoring_status():
     """Get monitoring status"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM users")
+        user_count = cursor.fetchone()['count']
+    
     return {
         "monitoring": monitoring_active,
-        "pool_history": len(pool_history),
+        "pool_history": {pool: len(history) for pool, history in pool_history.items()},
+        "monitored_pools": len(monitored_pools),
+        "pools": list(monitored_pools),
         "monitored_wallets": len(monitored_wallets),
         "wallets": list(monitored_wallets),
         "pending_actions": len(pending_actions),
-        "registered_users": len(list(get_db().__enter__().execute("SELECT COUNT(*) FROM users").fetchone()))
+        "registered_users": user_count
     }
 
 if __name__ == "__main__":
@@ -1317,4 +1468,5 @@ if __name__ == "__main__":
     print("🚀 Starting Jarvis on Celo v3.0...")
     print("📱 Telegram Bot Token configured")
     print("🗄️ Database initialized")
+    print("🔧 Pool addresses now configurable via API")
     uvicorn.run(app, host="0.0.0.0", port=8000)
