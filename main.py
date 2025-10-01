@@ -913,6 +913,32 @@ async def monitor_loop():
             print(f"Monitor loop error: {e}")
             await asyncio.sleep(60)
 
+@app.post("/telegram/setup-webhook")
+async def setup_telegram_webhook():
+    """Setup Telegram webhook - call this once after deployment"""
+    webhook_url = "https://singapore-token-hackathon-production.up.railway.app/telegram/webhook"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{TELEGRAM_API_URL}/setWebhook",
+            json={"url": webhook_url}
+        )
+        result = response.json()
+        return result
+
+@app.get("/telegram/webhook-info")
+async def get_webhook_info():
+    """Check current webhook status"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{TELEGRAM_API_URL}/getWebhookInfo")
+        return response.json()
+
+@app.post("/telegram/test-send")
+async def test_telegram_send(telegram_id: int, message: str = "Test message from Jarvis!"):
+    """Test sending a message to Telegram"""
+    result = await send_telegram_message(telegram_id, message)
+    return {"message_id": result, "success": result is not None}
+
 # ============================
 # TELEGRAM WEBHOOK HANDLER
 # ============================
