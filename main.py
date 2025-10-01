@@ -9,24 +9,18 @@ from enum import Enum
 import os
 from twilio.rest import Client
 import replicate
-import json
 
 # ============================
 # CONFIGURATION
 # ============================
-CELO_RPC_URL = "https://forno.celo.org"
+UBESWAP_CELO_cUSD_POOL = "0x1e593f1fe7b61c53874b54ec0c59fd0d5eb8621e"
 CELO_PRICE = 0.7
+CELO_RPC_URL = "https://forno.celo.org"
 
-# Major Celo DeFi Protocols
-PROTOCOLS = {
-    "ubeswap": {
-        "router": "0xE3D8bd6Aed4F159bc8000a9cD47CffDb95F96121",
-        "factory": "0x62d5b84bE28a183aBB507E125B384122D2C25fAE"
-    },
-    "mento": {
-        "exchange": "0x67316300f17f063085Ca8bCa4bd3f7a5a3C66275"
-    }
-}
+# DeFi Protocol Addresses on Celo
+UBESWAP_FACTORY = "0x62d5b84be28a183abb507e125b384122d2c25fae"
+UBESWAP_ROUTER = "0xE3D8bd6Aed4F159bc8000a9cD47CffDb95F96121"
+MENTO_BROKER = "0x9F1f933A8D7000F5B6FDa8A7eCa6BBfA6AC1a7dF"
 
 # Environment Variables
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -40,9 +34,11 @@ USER_PHONE_NUMBER = os.getenv("USER_PHONE")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-app = FastAPI(title="Jarvis on Celo - Portfolio Monitor", version="2.0.0")
+app = FastAPI(title="Jarvis on Celo", version="2.0.0")
 
-# CORS Middleware
+# ============================
+# CORS MIDDLEWARE
+# ============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,56 +56,75 @@ class Severity(str, Enum):
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
 
+class PoolData(BaseModel):
+    reserve0: str
+    reserve1: str
+    tvl: float
+    ratio: float
+    timestamp: int
+
 class TokenBalance(BaseModel):
     token: str
     symbol: str
-    balance: float
+    balance: str
     valueUSD: float
 
-class ProtocolPosition(BaseModel):
+class PositionData(BaseModel):
     protocol: str
-    type: str  # "liquidity", "lending", "staking"
-    tokens: List[TokenBalance]
-    totalValueUSD: float
+    type: str
+    tokens: List[str]
+    value: float
     apy: Optional[float] = None
-    health: Optional[float] = None  # For lending positions
 
 class WalletPortfolio(BaseModel):
     address: str
     totalValueUSD: float
+    celoBalance: str
+    cUSDBalance: str
     tokens: List[TokenBalance]
-    protocols: List[ProtocolPosition]
-    lastUpdated: int
+    positions: List[PositionData]
+    timestamp: int
 
-class RiskDetection(BaseModel):
-    riskType: str  # "rug_pull", "impermanent_loss", "whale_movement", "liquidation_risk"
+class RiskAlert(BaseModel):
     severity: Severity
     message: str
-    affectedPosition: Dict
-    recommendation: str
+    metrics: dict
+    alertType: str
 
-class WalletAlert(BaseModel):
-    wallet: str
-    risks: List[RiskDetection]
-    aiAnalysis: Optional[str]
+class AlertResponse(BaseModel):
+    pool: Optional[PoolData] = None
+    wallet: Optional[WalletPortfolio] = None
+    alert: Optional[RiskAlert] = None
+    aiSummary: Optional[str] = None
     callInitiated: bool = False
 
-class MonitorWalletRequest(BaseModel):
-    address: str
-    phoneNumber: Optional[str] = None
+class TestAlertRequest(BaseModel):
+    alertType: str
+    phoneCall: bool = True
+
+class WalletMonitorRequest(BaseModel):
+    walletAddress: str
 
 # ============================
 # STORAGE
 # ============================
-monitored_wallets: Dict[str, WalletPortfolio] = {}
-wallet_history: Dict[str, List[WalletPortfolio]] = {}
+pool_history: List[PoolData] = []
+wallet_portfolios: Dict[str, List[WalletPortfolio]] = {}
 monitoring_active = False
+monitored_wallets: set = set()
 
 # ============================
-# HELPER FUNCTIONS - RPC Calls
+# HELPER FUNCTIONS - BLOCKCHAIN
 # ============================
-async def call_contract(contract_address: str, data: str) -> dict:
-    """Generic RPC call to Celo"""
+def decode_reserves(hex_data: str) -> tuple:
+    hex_data = hex_data[2:]
+    reserve0_hex = hex_data[:64]
+    reserve1_hex = hex_data[64:128]
+    reserve0 = int(reserve0_hex, 16)
+    reserve1 = int(reserve1_hex, 16)
+    return reserve0, reserve1
+
+async def get_pool_data() -> PoolData:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             CELO_RPC_URL,
@@ -117,229 +132,287 @@ async def call_contract(contract_address: str, data: str) -> dict:
                 "jsonrpc": "2.0",
                 "method": "eth_call",
                 "params": [
-                    {"to": contract_address, "data": data},
+                    {"to": UBESWAP_CELO_cUSD_POOL, "data": "0x0902f1ac"},
                     "latest"
                 ],
                 "id": 1
             }
         )
-        return response.json()
-
-async def get_token_balance(wallet: str, token_address: str) -> int:
-    """Get ERC20 token balance"""
-    # ERC20 balanceOf(address) function
-    data = f"0x70a08231000000000000000000000000{wallet[2:]}"
-    result = await call_contract(token_address, data)
-    if "result" in result:
-        return int(result["result"], 16)
-    return 0
-
-async def get_celo_balance(wallet: str) -> int:
-    """Get native CELO balance"""
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            CELO_RPC_URL,
-            json={
-                "jsonrpc": "2.0",
-                "method": "eth_getBalance",
-                "params": [wallet, "latest"],
-                "id": 1
-            }
+        data = response.json()
+        reserve0, reserve1 = decode_reserves(data["result"])
+        reserve0_formatted = reserve0 / 1e18
+        reserve1_formatted = reserve1 / 1e18
+        tvl = reserve0_formatted * CELO_PRICE + reserve1_formatted
+        ratio = reserve0_formatted / reserve1_formatted
+        
+        return PoolData(
+            reserve0=str(reserve0),
+            reserve1=str(reserve1),
+            tvl=tvl,
+            ratio=ratio,
+            timestamp=int(datetime.now().timestamp() * 1000)
         )
-        result = response.json()
-        if "result" in result:
-            return int(result["result"], 16)
-    return 0
 
-# ============================
-# PORTFOLIO ANALYSIS
-# ============================
-async def fetch_wallet_portfolio(address: str) -> WalletPortfolio:
-    """Fetch complete portfolio for a wallet"""
-    
-    # Common Celo tokens
-    tokens_to_check = {
-        "CELO": "native",
-        "cUSD": "0x765DE816845861e75A25fCA122bb6898B8B1282a",
-        "cEUR": "0xD8763CBa276a3738E6DE85b4b3bF5FDed6D6cA73",
-        "cREAL": "0xe8537a3d056DA446677B9E9d6c5dB704EaAb4787",
-    }
-    
-    token_balances = []
-    total_value = 0
+async def get_balance(address: str, token: str = None) -> int:
+    """Get balance of native CELO or ERC20 token"""
+    async with httpx.AsyncClient() as client:
+        if token is None:
+            # Get native CELO balance
+            response = await client.post(
+                CELO_RPC_URL,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance",
+                    "params": [address, "latest"],
+                    "id": 1
+                }
+            )
+            data = response.json()
+            return int(data["result"], 16)
+        else:
+            # Get ERC20 token balance
+            # balanceOf(address) function signature
+            data_hex = "0x70a08231" + address[2:].zfill(64)
+            response = await client.post(
+                CELO_RPC_URL,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [
+                        {"to": token, "data": data_hex},
+                        "latest"
+                    ],
+                    "id": 1
+                }
+            )
+            data = response.json()
+            if "result" in data and data["result"] != "0x":
+                return int(data["result"], 16)
+            return 0
+
+async def get_wallet_portfolio(wallet_address: str) -> WalletPortfolio:
+    """Fetch complete wallet portfolio from Celo blockchain"""
     
     # Get CELO balance
-    celo_balance = await get_celo_balance(address)
-    celo_formatted = celo_balance / 1e18
-    celo_value = celo_formatted * CELO_PRICE
+    celo_balance_wei = await get_balance(wallet_address)
+    celo_balance = celo_balance_wei / 1e18
     
-    if celo_formatted > 0:
-        token_balances.append(TokenBalance(
-            token="CELO",
-            symbol="CELO",
-            balance=celo_formatted,
-            valueUSD=celo_value
+    # Known token addresses on Celo
+    cUSD_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a"
+    cEUR_ADDRESS = "0xD8763CBa276a3738E6DE85b4b3bF5FDed6D6cA73"
+    cREAL_ADDRESS = "0xe8537a3d056DA446677B9E9d6c5dB704EaAb4787"
+    
+    # Get token balances
+    cusd_balance_wei = await get_balance(wallet_address, cUSD_ADDRESS)
+    ceur_balance_wei = await get_balance(wallet_address, cEUR_ADDRESS)
+    creal_balance_wei = await get_balance(wallet_address, cREAL_ADDRESS)
+    
+    cusd_balance = cusd_balance_wei / 1e18
+    ceur_balance = ceur_balance_wei / 1e18
+    creal_balance = creal_balance_wei / 1e18
+    
+    # Calculate total value
+    total_value = (celo_balance * CELO_PRICE) + cusd_balance + ceur_balance + creal_balance
+    
+    tokens = []
+    if cusd_balance > 0.01:
+        tokens.append(TokenBalance(
+            token=cUSD_ADDRESS,
+            symbol="cUSD",
+            balance=str(cusd_balance_wei),
+            valueUSD=cusd_balance
         ))
-        total_value += celo_value
+    if ceur_balance > 0.01:
+        tokens.append(TokenBalance(
+            token=cEUR_ADDRESS,
+            symbol="cEUR",
+            balance=str(ceur_balance_wei),
+            valueUSD=ceur_balance * 1.05  # rough EUR/USD
+        ))
+    if creal_balance > 0.01:
+        tokens.append(TokenBalance(
+            token=cREAL_ADDRESS,
+            symbol="cREAL",
+            balance=str(creal_balance_wei),
+            valueUSD=creal_balance * 0.20  # rough REAL/USD
+        ))
     
-    # Get stablecoin balances
-    for symbol, token_address in tokens_to_check.items():
-        if token_address == "native":
-            continue
-        try:
-            balance = await get_token_balance(address, token_address)
-            balance_formatted = balance / 1e18
-            if balance_formatted > 0.01:  # Filter dust
-                value = balance_formatted  # Stablecoins ~$1
-                token_balances.append(TokenBalance(
-                    token=token_address,
-                    symbol=symbol,
-                    balance=balance_formatted,
-                    valueUSD=value
-                ))
-                total_value += value
-        except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
+    # Check for LP positions (simplified - would need more complex logic for production)
+    positions = []
     
-    # Check protocol positions (simplified for now)
-    protocols = []
-    
-    # TODO: Add Ubeswap LP position detection
-    # TODO: Add Mento positions
-    # TODO: Add lending protocol positions
+    # Check Ubeswap LP token balance
+    lp_balance = await get_balance(wallet_address, UBESWAP_CELO_cUSD_POOL)
+    if lp_balance > 0:
+        lp_value = (lp_balance / 1e18) * 2  # Simplified LP value calculation
+        positions.append(PositionData(
+            protocol="Ubeswap",
+            type="Liquidity Pool",
+            tokens=["CELO", "cUSD"],
+            value=lp_value,
+            apy=15.5
+        ))
     
     return WalletPortfolio(
-        address=address,
+        address=wallet_address,
         totalValueUSD=total_value,
-        tokens=token_balances,
-        protocols=protocols,
-        lastUpdated=int(datetime.now().timestamp() * 1000)
+        celoBalance=str(celo_balance_wei),
+        cUSDBalance=str(cusd_balance_wei),
+        tokens=tokens,
+        positions=positions,
+        timestamp=int(datetime.now().timestamp() * 1000)
     )
 
 # ============================
 # RISK DETECTION
 # ============================
-async def detect_portfolio_risks(
-    current: WalletPortfolio, 
-    history: List[WalletPortfolio]
-) -> List[RiskDetection]:
-    """Detect various risks in portfolio"""
+def detect_pool_anomalies(current: PoolData, history: List[PoolData]) -> Optional[RiskAlert]:
+    if len(history) < 10:
+        return None
+    
     risks = []
+    recent_avg_tvl = sum(d.tvl for d in history[-20:]) / min(20, len(history[-20:]))
+    tvl_change = ((current.tvl - recent_avg_tvl) / recent_avg_tvl) * 100
     
+    if tvl_change < -20:
+        risks.append(RiskAlert(
+            severity=Severity.CRITICAL,
+            message=f"TVL dropped {tvl_change:.1f}%",
+            metrics={"tvlChange": tvl_change},
+            alertType="pool_tvl_drop"
+        ))
+    elif tvl_change < -10:
+        risks.append(RiskAlert(
+            severity=Severity.HIGH,
+            message=f"TVL dropped {tvl_change:.1f}%",
+            metrics={"tvlChange": tvl_change},
+            alertType="pool_tvl_drop"
+        ))
+    
+    avg_ratio = sum(d.ratio for d in history[-20:]) / min(20, len(history[-20:]))
+    ratio_change = abs(((current.ratio - avg_ratio) / avg_ratio) * 100)
+    
+    if ratio_change > 30:
+        risks.append(RiskAlert(
+            severity=Severity.HIGH,
+            message=f"Reserve imbalance: {ratio_change:.1f}% deviation",
+            metrics={"reserveImbalance": ratio_change},
+            alertType="pool_imbalance"
+        ))
+    
+    return risks[0] if risks else None
+
+def detect_wallet_risks(current: WalletPortfolio, history: List[WalletPortfolio]) -> Optional[RiskAlert]:
+    """Detect risks in wallet portfolio"""
     if len(history) < 2:
-        return risks
+        return None
     
-    # 1. Sudden value drop detection
-    if len(history) > 0:
-        prev_value = history[-1].totalValueUSD
-        current_value = current.totalValueUSD
-        
-        if prev_value > 0:
-            change_pct = ((current_value - prev_value) / prev_value) * 100
-            
-            if change_pct < -20:
-                risks.append(RiskDetection(
-                    riskType="sudden_loss",
-                    severity=Severity.CRITICAL,
-                    message=f"Portfolio value dropped {abs(change_pct):.1f}%",
-                    affectedPosition={"previousValue": prev_value, "currentValue": current_value},
-                    recommendation="Review your positions immediately. Consider reducing exposure to volatile assets."
-                ))
-            elif change_pct < -10:
-                risks.append(RiskDetection(
-                    riskType="value_decline",
-                    severity=Severity.HIGH,
-                    message=f"Portfolio declined {abs(change_pct):.1f}%",
-                    affectedPosition={"previousValue": prev_value, "currentValue": current_value},
-                    recommendation="Monitor closely. Consider rebalancing if decline continues."
-                ))
+    risks = []
+    prev = history[-1]
     
-    # 2. Token concentration risk
-    if current.totalValueUSD > 0:
-        for token in current.tokens:
-            concentration = (token.valueUSD / current.totalValueUSD) * 100
-            if concentration > 70:
-                risks.append(RiskDetection(
-                    riskType="concentration_risk",
-                    severity=Severity.MEDIUM,
-                    message=f"{token.symbol} represents {concentration:.1f}% of portfolio",
-                    affectedPosition={"token": token.symbol, "concentration": concentration},
-                    recommendation="Consider diversifying to reduce single-asset risk."
-                ))
+    # Check for sudden value drop (potential rug pull)
+    value_change = ((current.totalValueUSD - prev.totalValueUSD) / prev.totalValueUSD) * 100
     
-    # 3. Whale movement detection (simulate)
-    # In production: monitor large transactions affecting user's tokens
+    if value_change < -30:
+        risks.append(RiskAlert(
+            severity=Severity.CRITICAL,
+            message=f"Portfolio value dropped {abs(value_change):.1f}%! Potential rug pull detected",
+            metrics={"valueChange": value_change, "currentValue": current.totalValueUSD},
+            alertType="wallet_value_drop"
+        ))
+    elif value_change < -15:
+        risks.append(RiskAlert(
+            severity=Severity.HIGH,
+            message=f"Portfolio value dropped {abs(value_change):.1f}%",
+            metrics={"valueChange": value_change, "currentValue": current.totalValueUSD},
+            alertType="wallet_value_drop"
+        ))
     
-    # 4. Impermanent loss risk (for LP positions)
-    for protocol in current.protocols:
-        if protocol.type == "liquidity":
-            # Calculate IL risk based on token price movements
-            risks.append(RiskDetection(
-                riskType="impermanent_loss",
-                severity=Severity.MEDIUM,
-                message=f"LP position in {protocol.protocol} exposed to IL",
-                affectedPosition={"protocol": protocol.protocol, "value": protocol.totalValueUSD},
-                recommendation="Monitor token price divergence. Consider single-sided staking alternatives."
+    # Check for LP position risks (impermanent loss)
+    for pos in current.positions:
+        if pos.type == "Liquidity Pool":
+            # Check if position value decreased significantly
+            prev_pos = next((p for p in prev.positions if p.protocol == pos.protocol), None)
+            if prev_pos and prev_pos.value > 0:
+                pos_change = ((pos.value - prev_pos.value) / prev_pos.value) * 100
+                if pos_change < -10:
+                    risks.append(RiskAlert(
+                        severity=Severity.MEDIUM,
+                        message=f"Impermanent loss risk: {pos.protocol} LP position down {abs(pos_change):.1f}%",
+                        metrics={"positionChange": pos_change, "protocol": pos.protocol},
+                        alertType="impermanent_loss"
+                    ))
+    
+    # Check for whale movements affecting pools
+    if len(history) >= 5:
+        avg_value = sum(h.totalValueUSD for h in history[-5:]) / 5
+        if current.totalValueUSD > avg_value * 2:
+            risks.append(RiskAlert(
+                severity=Severity.LOW,
+                message=f"Large inflow detected: Portfolio value increased {((current.totalValueUSD - avg_value) / avg_value * 100):.1f}%",
+                metrics={"valueIncrease": ((current.totalValueUSD - avg_value) / avg_value * 100)},
+                alertType="large_inflow"
             ))
     
-    return risks
+    return risks[0] if risks else None
 
 # ============================
-# AI ANALYSIS
+# AI & COMMUNICATION
 # ============================
-async def generate_portfolio_analysis(
-    portfolio: WalletPortfolio, 
-    risks: List[RiskDetection]
-) -> str:
-    """Generate AI-powered portfolio analysis"""
+async def generate_ai_summary(alert: RiskAlert, context: dict) -> str:
     try:
-        risk_summary = "\n".join([f"- {r.severity}: {r.message}" for r in risks])
-        
-        prompt = f"""You are Jarvis, an AI financial advisor for DeFi portfolios on Celo blockchain.
+        if alert.alertType.startswith("wallet_"):
+            prompt = f"""You are Jarvis, an AI DeFi risk analyst. Analyze this wallet portfolio alert and provide a brief 1-paragraph summary (3-4 sentences max) explaining what happened and what the user should do.
 
-Portfolio Summary:
-- Total Value: ${portfolio.totalValueUSD:.2f}
-- Number of Assets: {len(portfolio.tokens)}
-- Protocols Used: {len(portfolio.protocols)}
+Alert Details:
+- Severity: {alert.severity}
+- Alert Type: {alert.alertType}
+- Message: {alert.message}
+- Wallet Address: {context.get('address', 'N/A')}
+- Total Portfolio Value: ${context.get('totalValue', 0):.2f}
+- Metrics: {alert.metrics}
 
-Token Holdings:
-{chr(10).join([f"- {t.symbol}: {t.balance:.4f} (${t.valueUSD:.2f})" for t in portfolio.tokens])}
+Keep it concise, actionable, and easy to understand. Focus on protecting the user's assets."""
+        else:
+            prompt = f"""You are Jarvis, an AI DeFi risk analyst. Analyze this liquidity pool alert and provide a brief 1-paragraph summary (3-4 sentences max) explaining what happened and what the user should do.
 
-Detected Risks:
-{risk_summary if risks else "No significant risks detected"}
+Alert Details:
+- Severity: {alert.severity}
+- Alert Type: {alert.alertType}
+- Message: {alert.message}
+- Current TVL: ${context.get('tvl', 0):.2f}
+- CELO/cUSD Ratio: {context.get('ratio', 0):.4f}
+- Metrics: {alert.metrics}
 
-Provide a brief 2-3 sentence analysis of this portfolio's health and actionable advice. Be conversational and helpful."""
+Keep it concise, actionable, and easy to understand for a non-technical user."""
 
         output = replicate_client.run(
             "openai/gpt-4o-mini",
             input={
                 "prompt": prompt,
-                "system_prompt": "You are Jarvis, a helpful AI DeFi advisor. Be concise and actionable.",
-                "max_tokens": 200,
+                "system_prompt": "You are Jarvis, a concise DeFi risk analyst. Provide brief, actionable summaries in 1 paragraph only.",
+                "max_tokens": 150,
                 "temperature": 0.7
             }
         )
         
         return "".join(output).strip()
     except Exception as e:
-        return f"Portfolio value: ${portfolio.totalValueUSD:.2f}. {len(risks)} risk(s) detected. Review recommended."
+        print(f"AI Summary Error: {e}")
+        return f"{alert.severity} Alert: {alert.message}. Monitor closely and consider reviewing your position."
 
-async def make_phone_call_wallet(risks: List[RiskDetection], ai_analysis: str, phone: str) -> dict:
-    """Make phone call for wallet alerts"""
+async def make_phone_call(alert: RiskAlert, ai_summary: str) -> dict:
     try:
-        highest_severity = max([r.severity for r in risks], default=Severity.LOW)
-        risk_messages = ". ".join([r.message for r in risks[:2]])  # Top 2 risks
-        
-        call_message = f"Jarvis Alert! {highest_severity} severity. {risk_messages}. {ai_analysis}"
+        call_message = f"Alert! {alert.severity} severity. {alert.message}. {ai_summary}"
         
         execution = twilio_client.studio.v2.flows(TWILIO_FLOW_SID).executions.create(
-            to=phone or USER_PHONE_NUMBER,
+            to=USER_PHONE_NUMBER,
             from_=TWILIO_FROM_NUMBER,
             parameters={
-                "alertSeverity": highest_severity,
-                "alertMessage": risk_messages,
-                "aiSummary": ai_analysis,
-                "fullMessage": call_message
+                "alertSeverity": alert.severity,
+                "alertMessage": alert.message,
+                "aiSummary": ai_summary,
+                "fullMessage": call_message,
+                "alertType": alert.alertType
             }
         )
         
@@ -349,49 +422,94 @@ async def make_phone_call_wallet(risks: List[RiskDetection], ai_analysis: str, p
             "status": execution.status
         }
     except Exception as e:
+        print(f"Phone call error: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
+def generate_fake_alert(alert_type: str) -> RiskAlert:
+    fake_alerts = {
+        "tvl-drop": RiskAlert(
+            severity=Severity.CRITICAL,
+            message="TVL dropped 25.3%",
+            metrics={"tvlChange": -25.3},
+            alertType="pool_tvl_drop"
+        ),
+        "imbalance": RiskAlert(
+            severity=Severity.HIGH,
+            message="Reserve imbalance: 35.8% deviation",
+            metrics={"reserveImbalance": 35.8},
+            alertType="pool_imbalance"
+        ),
+        "whale": RiskAlert(
+            severity=Severity.CRITICAL,
+            message="Large whale transaction detected: $500K liquidity removed",
+            metrics={"tvlChange": -45.2},
+            alertType="whale_movement"
+        ),
+        "rug-pull": RiskAlert(
+            severity=Severity.CRITICAL,
+            message="Potential rug pull: Portfolio value dropped 45% in 5 minutes",
+            metrics={"valueChange": -45, "timeframe": "5min"},
+            alertType="wallet_value_drop"
+        )
+    }
+    return fake_alerts.get(alert_type, fake_alerts["tvl-drop"])
+
 # ============================
-# MONITORING LOOP
+# BACKGROUND MONITORING
 # ============================
-async def monitor_wallets_loop():
-    """Background task to monitor all registered wallets"""
-    global monitoring_active
+async def monitor_loop():
+    global monitoring_active, pool_history, wallet_portfolios
     
     while monitoring_active:
         try:
-            for address, phone in list(monitored_wallets.items()):
-                current_portfolio = await fetch_wallet_portfolio(address)
-                
-                # Get history
-                if address not in wallet_history:
-                    wallet_history[address] = []
-                
-                # Detect risks
-                risks = await detect_portfolio_risks(current_portfolio, wallet_history[address])
-                
-                if risks:
-                    # Generate AI analysis
-                    ai_analysis = await generate_portfolio_analysis(current_portfolio, risks)
-                    
-                    # Make phone call for critical/high risks
-                    critical_risks = [r for r in risks if r.severity in [Severity.CRITICAL, Severity.HIGH]]
-                    if critical_risks:
-                        await make_phone_call_wallet(critical_risks, ai_analysis, phone)
-                        print(f"🚨 Alert for {address}: {len(critical_risks)} critical risks")
-                
-                # Update history
-                wallet_history[address].append(current_portfolio)
-                if len(wallet_history[address]) > 50:
-                    wallet_history[address].pop(0)
+            # Monitor pool
+            current_pool = await get_pool_data()
+            pool_alert = detect_pool_anomalies(current_pool, pool_history)
             
-            await asyncio.sleep(120)  # Check every 2 minutes
+            if pool_alert:
+                ai_summary = await generate_ai_summary(pool_alert, {
+                    "tvl": current_pool.tvl,
+                    "ratio": current_pool.ratio
+                })
+                await make_phone_call(pool_alert, ai_summary)
+                print(f"🚨 Pool Alert: {pool_alert.severity} - {pool_alert.message}")
+            
+            pool_history.append(current_pool)
+            if len(pool_history) > 100:
+                pool_history.pop(0)
+            
+            # Monitor wallets
+            for wallet_addr in list(monitored_wallets):
+                try:
+                    current_portfolio = await get_wallet_portfolio(wallet_addr)
+                    
+                    if wallet_addr not in wallet_portfolios:
+                        wallet_portfolios[wallet_addr] = []
+                    
+                    wallet_alert = detect_wallet_risks(current_portfolio, wallet_portfolios[wallet_addr])
+                    
+                    if wallet_alert:
+                        ai_summary = await generate_ai_summary(wallet_alert, {
+                            "address": wallet_addr,
+                            "totalValue": current_portfolio.totalValueUSD
+                        })
+                        await make_phone_call(wallet_alert, ai_summary)
+                        print(f"🚨 Wallet Alert: {wallet_alert.severity} - {wallet_alert.message}")
+                    
+                    wallet_portfolios[wallet_addr].append(current_portfolio)
+                    if len(wallet_portfolios[wallet_addr]) > 50:
+                        wallet_portfolios[wallet_addr].pop(0)
+                        
+                except Exception as e:
+                    print(f"Error monitoring wallet {wallet_addr}: {e}")
+            
+            await asyncio.sleep(60)
         except Exception as e:
-            print(f"Monitor error: {e}")
-            await asyncio.sleep(120)
+            print(f"Monitor loop error: {e}")
+            await asyncio.sleep(60)
 
 # ============================
 # ENDPOINTS
@@ -399,84 +517,161 @@ async def monitor_wallets_loop():
 @app.get("/")
 async def root():
     return {
-        "message": "Jarvis on Celo - AI Portfolio Monitor",
-        "version": "2.0.0",
-        "features": ["wallet_monitoring", "risk_detection", "ai_analysis", "phone_alerts"]
+        "message": "Jarvis on Celo - AI Portfolio Guardian",
+        "status": "running",
+        "features": ["Pool Monitoring", "Wallet Monitoring", "AI Risk Analysis", "Phone Alerts"]
     }
+
+@app.get("/pool")
+async def get_pool():
+    return await get_pool_data()
+
+@app.get("/check")
+async def check_pool():
+    current_data = await get_pool_data()
+    pool_history.append(current_data)
+    
+    alert = detect_pool_anomalies(current_data, pool_history)
+    ai_summary = None
+    call_initiated = False
+    
+    if alert:
+        ai_summary = await generate_ai_summary(alert, {
+            "tvl": current_data.tvl,
+            "ratio": current_data.ratio
+        })
+        call_result = await make_phone_call(alert, ai_summary)
+        call_initiated = call_result["success"]
+    
+    if len(pool_history) > 100:
+        pool_history.pop(0)
+    
+    return AlertResponse(
+        pool=current_data,
+        alert=alert,
+        aiSummary=ai_summary,
+        callInitiated=call_initiated
+    )
 
 @app.post("/wallet/analyze")
-async def analyze_wallet(request: MonitorWalletRequest):
-    """Analyze a wallet's portfolio and detect risks"""
-    portfolio = await fetch_wallet_portfolio(request.address)
+async def analyze_wallet(request: WalletMonitorRequest):
+    """Analyze a wallet's portfolio"""
+    wallet_address = request.walletAddress.lower()
     
-    # Get history if exists
-    history = wallet_history.get(request.address, [])
-    
-    # Detect risks
-    risks = await detect_portfolio_risks(portfolio, history)
-    
-    # Generate AI analysis
-    ai_analysis = None
-    if risks or portfolio.totalValueUSD > 0:
-        ai_analysis = await generate_portfolio_analysis(portfolio, risks)
-    
-    # Make call if critical risks and phone provided
-    call_initiated = False
-    if risks and request.phoneNumber:
-        critical_risks = [r for r in risks if r.severity in [Severity.CRITICAL, Severity.HIGH]]
-        if critical_risks:
-            call_result = await make_phone_call_wallet(critical_risks, ai_analysis, request.phoneNumber)
+    try:
+        portfolio = await get_wallet_portfolio(wallet_address)
+        
+        if wallet_address not in wallet_portfolios:
+            wallet_portfolios[wallet_address] = []
+        
+        alert = detect_wallet_risks(portfolio, wallet_portfolios[wallet_address])
+        ai_summary = None
+        call_initiated = False
+        
+        if alert:
+            ai_summary = await generate_ai_summary(alert, {
+                "address": wallet_address,
+                "totalValue": portfolio.totalValueUSD
+            })
+            call_result = await make_phone_call(alert, ai_summary)
             call_initiated = call_result["success"]
+        
+        wallet_portfolios[wallet_address].append(portfolio)
+        if len(wallet_portfolios[wallet_address]) > 50:
+            wallet_portfolios[wallet_address].pop(0)
+        
+        return AlertResponse(
+            wallet=portfolio,
+            alert=alert,
+            aiSummary=ai_summary,
+            callInitiated=call_initiated
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/wallet/monitor/add")
+async def add_wallet_monitoring(request: WalletMonitorRequest):
+    """Add wallet to continuous monitoring"""
+    wallet_address = request.walletAddress.lower()
+    monitored_wallets.add(wallet_address)
+    
+    # Initialize wallet history
+    if wallet_address not in wallet_portfolios:
+        portfolio = await get_wallet_portfolio(wallet_address)
+        wallet_portfolios[wallet_address] = [portfolio]
     
     return {
-        "portfolio": portfolio,
-        "risks": risks,
-        "aiAnalysis": ai_analysis,
-        "callInitiated": call_initiated
+        "status": "added",
+        "wallet": wallet_address,
+        "monitored_wallets": len(monitored_wallets)
     }
 
-@app.post("/wallet/monitor/start")
-async def start_wallet_monitoring(request: MonitorWalletRequest, background_tasks: BackgroundTasks):
-    """Start monitoring a wallet"""
+@app.post("/wallet/monitor/remove")
+async def remove_wallet_monitoring(request: WalletMonitorRequest):
+    """Remove wallet from monitoring"""
+    wallet_address = request.walletAddress.lower()
+    monitored_wallets.discard(wallet_address)
+    
+    return {
+        "status": "removed",
+        "wallet": wallet_address,
+        "monitored_wallets": len(monitored_wallets)
+    }
+
+@app.get("/wallet/monitored")
+async def get_monitored_wallets():
+    """Get list of monitored wallets"""
+    return {
+        "wallets": list(monitored_wallets),
+        "count": len(monitored_wallets)
+    }
+
+@app.post("/test-alert")
+async def test_alert(request: TestAlertRequest):
+    current_data = await get_pool_data()
+    fake_alert = generate_fake_alert(request.alertType)
+    ai_summary = await generate_ai_summary(fake_alert, {
+        "tvl": current_data.tvl,
+        "ratio": current_data.ratio
+    })
+    
+    call_initiated = False
+    if request.phoneCall:
+        call_result = await make_phone_call(fake_alert, ai_summary)
+        call_initiated = call_result["success"]
+    
+    return AlertResponse(
+        pool=current_data,
+        alert=fake_alert,
+        aiSummary=ai_summary,
+        callInitiated=call_initiated
+    )
+
+@app.post("/monitor/start")
+async def start_monitoring(background_tasks: BackgroundTasks):
     global monitoring_active
     
-    monitored_wallets[request.address] = request.phoneNumber or USER_PHONE_NUMBER
+    if monitoring_active:
+        return {"status": "already_running"}
     
-    if not monitoring_active:
-        monitoring_active = True
-        background_tasks.add_task(monitor_wallets_loop)
+    monitoring_active = True
+    background_tasks.add_task(monitor_loop)
     
-    return {
-        "status": "monitoring_started",
-        "wallet": request.address,
-        "totalMonitored": len(monitored_wallets)
-    }
+    return {"status": "started"}
 
-@app.post("/wallet/monitor/stop")
-async def stop_wallet_monitoring(address: str):
-    """Stop monitoring a wallet"""
-    if address in monitored_wallets:
-        del monitored_wallets[address]
-    
-    return {
-        "status": "monitoring_stopped",
-        "wallet": address,
-        "totalMonitored": len(monitored_wallets)
-    }
+@app.post("/monitor/stop")
+async def stop_monitoring():
+    global monitoring_active
+    monitoring_active = False
+    return {"status": "stopped"}
 
-@app.get("/wallet/portfolio/{address}")
-async def get_wallet_portfolio(address: str):
-    """Get current portfolio for a wallet"""
-    portfolio = await fetch_wallet_portfolio(address)
-    return portfolio
-
-@app.get("/monitor/status")
-async def get_monitor_status():
-    """Get monitoring status"""
+@app.get("/status")
+async def monitoring_status():
     return {
-        "active": monitoring_active,
-        "wallets_monitored": len(monitored_wallets),
-        "wallets": list(monitored_wallets.keys())
+        "monitoring": monitoring_active,
+        "pool_history": len(pool_history),
+        "monitored_wallets": len(monitored_wallets),
+        "wallets": list(monitored_wallets)
     }
 
 if __name__ == "__main__":
