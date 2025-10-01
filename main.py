@@ -1,5 +1,6 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import httpx
@@ -12,6 +13,7 @@ import replicate
 import sqlite3
 from contextlib import contextmanager
 import json
+import traceback
 
 # ============================
 # CONFIGURATION
@@ -125,15 +127,38 @@ def get_db():
 init_database()
 
 # ============================
-# CORS MIDDLEWARE
+# CORS MIDDLEWARE - Enhanced
 # ============================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5501",
+        "http://127.0.0.1:5501", 
+        "https://spontaneous-entremet-cef6ae.netlify.app",
+        "*"  # Allow all origins
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
+
+# Add global exception handler for better CORS support
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler that ensures CORS headers are always sent"""
+    print(f"Global exception caught: {exc}")
+    traceback.print_exc()
+    
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "detail": "Internal server error"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 # ============================
 # MODELS
@@ -1151,6 +1176,19 @@ async def root():
         ]
     }
 
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Handle OPTIONS requests for CORS preflight"""
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
+
 @app.post("/users/register")
 async def register_user(request: TelegramUserRegister):
     """Register a new Telegram user"""
@@ -1224,21 +1262,51 @@ async def check_pool_endpoint(request: PoolMonitorRequest):
 @app.post("/pool/monitor/add")
 async def add_pool_monitoring(request: PoolMonitorRequest):
     """Add pool to continuous monitoring"""
-    pool_address = request.poolAddress.lower()
-    monitored_pools.add(pool_address)
-    
-    if pool_address not in pool_history:
-        pool_data = await get_pool_data(pool_address)
-        pool_history[pool_address] = [pool_data]
-    
-    if request.telegramUserId:
-        register_telegram_user(request.telegramUserId, pool_address=pool_address)
-    
-    return {
-        "status": "added",
-        "pool": pool_address,
-        "monitored_pools": len(monitored_pools)
-    }
+    try:
+        pool_address = request.poolAddress.lower()
+        monitored_pools.add(pool_address)
+        
+        if pool_address not in pool_history:
+            try:
+                pool_data = await get_pool_data(pool_address)
+                pool_history[pool_address] = [pool_data]
+            except Exception as e:
+                print(f"Error fetching pool data: {e}")
+                # Still add to monitoring even if initial fetch fails
+                pool_history[pool_address] = []
+        
+        if request.telegramUserId:
+            try:
+                register_telegram_user(request.telegramUserId, pool_address=pool_address)
+            except Exception as e:
+                print(f"Error registering telegram user: {e}")
+                # Continue even if telegram registration fails
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "added",
+                "pool": pool_address,
+                "monitored_pools": len(monitored_pools)
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        print(f"Error in add_pool_monitoring: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Failed to add pool monitoring"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
 
 @app.post("/pool/monitor/remove")
 async def remove_pool_monitoring(request: PoolMonitorRequest):
@@ -1410,19 +1478,55 @@ async def get_actions_history():
 @app.post("/test-alert")
 async def test_alert(request: TestAlertRequest):
     """Test alert system with fake data"""
-    pool_address = request.poolAddress or "0x1e593f1fe7b61c53874b54ec0c59fd0d5eb8621e"
-    current_data = await get_pool_data(pool_address)
-    fake_alert = generate_fake_alert(request.alertType)
-    
-    response = await process_alert_with_action(
-        fake_alert,
-        {"pool_address": pool_address, "tvl": current_data.tvl, "ratio": current_data.ratio},
-        telegram_id=request.telegramUserId,
-        make_call=request.phoneCall
-    )
-    
-    response.pool = current_data
-    return response
+    try:
+        pool_address = request.poolAddress or "0x1e593f1fe7b61c53874b54ec0c59fd0d5eb8621e"
+        
+        try:
+            current_data = await get_pool_data(pool_address)
+        except Exception as e:
+            print(f"Error fetching pool data for test: {e}")
+            # Create mock data if pool fetch fails
+            current_data = PoolData(
+                pool_address=pool_address,
+                reserve0="1000000000000000000000",
+                reserve1="1000000000000000000000",
+                tvl=2000.0,
+                ratio=1.0,
+                timestamp=int(datetime.now().timestamp() * 1000)
+            )
+        
+        fake_alert = generate_fake_alert(request.alertType)
+        
+        response = await process_alert_with_action(
+            fake_alert,
+            {"pool_address": pool_address, "tvl": current_data.tvl, "ratio": current_data.ratio},
+            telegram_id=request.telegramUserId,
+            make_call=request.phoneCall
+        )
+        
+        response.pool = current_data
+        
+        return JSONResponse(
+            status_code=200,
+            content=response.dict(),
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    except Exception as e:
+        print(f"Error in test_alert: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Failed to send test alert"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
 
 @app.post("/monitor/start")
 async def start_monitoring(background_tasks: BackgroundTasks):
