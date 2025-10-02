@@ -237,15 +237,21 @@ bash- Python 3.9+
 - Telegram Bot Token
 - Twilio Account (for phone alerts)
 - Replicate API Token (for AI)
+  
 Installation
+
+
 bash# Clone repository
+
 git clone https://github.com/yourusername/jarvis-on-celo.git
 cd jarvis-on-celo
+
 
 # Install dependencies
 
 
 pip install -r requirements.txt
+
 
 # Set environment variables
 
@@ -260,6 +266,7 @@ export REPLICATE_API_TOKEN="your_token"
 
 export USER_PHONE="+1234567890"
 
+
 # Initialize database
 
 
@@ -267,6 +274,7 @@ python main.py
 Quick Start
 bash# Start the API server
 uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 # In Telegram, message your bot:
 
@@ -277,10 +285,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 /pool 0xPoolAddress
 
+
 # Start monitoring
+
 curl -X POST http://localhost:8000/monitor/start
 
 🎮 Usage Examples
+
 Monitor a Liquidity Pool
 bashcurl -X POST http://localhost:8000/pool/monitor/add \
   -H "Content-Type: application/json" \
@@ -301,25 +312,41 @@ bashcurl -X POST http://localhost:8000/test-alert \
 Check Monitoring Status
 bashcurl http://localhost:8000/status
 
+
 📈 Market Opportunity
+
+
 Target Market
 
 DeFi Investors: 5M+ active users globally
+
 Liquidity Providers: $50B+ in TVL across DEXs
+
 Institutional Investors: Growing crypto exposure
+
 
 Revenue Model
 
+
 Freemium: Basic monitoring free, advanced features paid
+
 Subscription: $10-50/month based on portfolio size
+
 Performance Fee: 5% of losses prevented
+
 API Access: Enterprise integration
+
+
 
 Competitive Advantage
 
+
 Only solution with AI-powered autonomous actions
+
 Multi-chain potential (starting with Celo)
+
 Human-in-the-loop safety model
+
 Open source foundation for community trust
 
 
