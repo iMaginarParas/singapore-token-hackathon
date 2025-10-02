@@ -251,9 +251,13 @@ pip install -r requirements.txt
 
 
 export TELEGRAM_BOT_TOKEN="your_token"
+
 export TWILIO_ACCOUNT_SID="your_sid"
+
 export TWILIO_AUTH_TOKEN="your_token"
+
 export REPLICATE_API_TOKEN="your_token"
+
 export USER_PHONE="+1234567890"
 
 # Initialize database
