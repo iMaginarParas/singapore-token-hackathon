@@ -32,6 +32,8 @@ JARVIS uses AI to make decisions but requires human approval before execution, c
 
 🏗️ Architecture
 mermaidgraph TB
+    
+    
     subgraph "Data Layer"
         A[Celo Blockchain] -->|RPC Calls| B[Pool Monitor]
         A -->|Balance Queries| C[Wallet Monitor]
@@ -61,8 +63,12 @@ mermaidgraph TB
     style J fill:#51cf66
     style A fill:#339af0
 
+
+
 🔄 System Flow
+
 mermaidsequenceDiagram
+
     participant BC as Celo Blockchain
     participant JV as JARVIS Monitor
     participant AI as GPT-4 Engine
@@ -102,6 +108,7 @@ mermaidsequenceDiagram
     end
 
 🚀 Features
+
 Core Capabilities
 FeatureDescriptionStatus🔍 
 
@@ -133,7 +140,10 @@ Portfolio Losses: Tracks value drops and impermanent loss
 Custom Thresholds: Configurable sensitivity levels
 
 AI Decision Making
+
 python# JARVIS AI Flow
+
+
 Context = {
     "alert": "TVL dropped 25%",
     "severity": "CRITICAL",
