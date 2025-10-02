@@ -103,7 +103,28 @@ mermaidsequenceDiagram
 
 🚀 Features
 Core Capabilities
-FeatureDescriptionStatus🔍 Pool MonitoringTrack TVL, reserves, and liquidity ratios✅ Live💼 Wallet MonitoringMonitor portfolio value and positions✅ Live🤖 AI Risk AnalysisGPT-4 powered threat assessment✅ Live📞 Phone AlertsInstant voice calls via Twilio✅ Live💬 Telegram BotInteractive notifications and controls✅ Live⚡ Action ProposalsAI-recommended protective measures✅ Live✋ User ApprovalHuman-in-the-loop execution✅ Live📊 DashboardWeb interface for configuration🚧 Beta🔐 Auto-ExecutionSmart contract interactions🚧 Dev
+FeatureDescriptionStatus🔍 
+
+Pool MonitoringTrack TVL, reserves, and liquidity 
+
+
+💼 Wallet MonitoringMonitor portfolio value and positions✅ Live 
+
+AI Risk Analysis GPT-4 powered threat assessment✅ Live
+
+📞 Phone AlertsInstant voice calls via Twilio✅ Live
+
+💬 Telegram BotInteractive notifications and controls✅ Live
+
+⚡ Action ProposalsAI-recommended protective measures✅ Live
+
+✋ User ApprovalHuman-in-the-loop execution✅ Live
+
+📊 DashboardWeb interface for configuration🚧 Beta
+
+🔐 Auto-ExecutionSmart contract interactions🚧 Dev
+
+
 Risk Detection
 
 TVL Drops: Detects sudden liquidity exits (potential rug pulls)
@@ -198,7 +219,9 @@ python{
 }
 
 🚦 Getting Started
+
 Prerequisites
+
 bash- Python 3.9+
 - Celo wallet address
 - Telegram Bot Token
@@ -210,9 +233,13 @@ git clone https://github.com/yourusername/jarvis-on-celo.git
 cd jarvis-on-celo
 
 # Install dependencies
+
+
 pip install -r requirements.txt
 
 # Set environment variables
+
+
 export TELEGRAM_BOT_TOKEN="your_token"
 export TWILIO_ACCOUNT_SID="your_sid"
 export TWILIO_AUTH_TOKEN="your_token"
@@ -220,14 +247,20 @@ export REPLICATE_API_TOKEN="your_token"
 export USER_PHONE="+1234567890"
 
 # Initialize database
+
+
 python main.py
 Quick Start
 bash# Start the API server
 uvicorn main:app --host 0.0.0.0 --port 8000
 
 # In Telegram, message your bot:
+
+
 /start
+
 /wallet 0xYourWalletAddress
+
 /pool 0xPoolAddress
 
 # Start monitoring
@@ -249,6 +282,8 @@ bashcurl -X POST http://localhost:8000/test-alert \
     "phoneCall": true,
     "telegramUserId": 123456789
   }'
+
+  
 Check Monitoring Status
 bashcurl http://localhost:8000/status
 
@@ -274,83 +309,4 @@ Human-in-the-loop safety model
 Open source foundation for community trust
 
 
-🗺️ Roadmap
-Phase 1: MVP ✅ (Current)
 
- Pool monitoring
- Wallet tracking
- AI risk analysis
- Telegram alerts
- Phone call system
- Action approval flow
-
-Phase 2: Q1 2025 🚧
-
- Smart contract execution
- Multi-pool strategies
- Advanced AI models
- Mobile app (iOS/Android)
- Dashboard analytics
-
-Phase 3: Q2 2025 📅
-
- Multi-chain support (Ethereum, Polygon, Arbitrum)
- DeFi protocol integrations (Uniswap, Aave, Compound)
- Social trading features
- DAO governance
-
-Phase 4: Q3 2025 📅
-
- Institutional features
- API marketplace
- Insurance partnerships
- Cross-chain strategies
-
-
-💰 Token Economics (Proposed)
-$JRVIS Token Utility
-
-Governance: Vote on risk parameters
-Staking: Earn fees from protected portfolios
-Premium Access: Unlock advanced AI features
-Referrals: Earn tokens for new users
-
-
-🤝 Contributing
-We welcome contributions! Areas we need help:
-
-Smart contract development (Solidity)
-Frontend development (React)
-AI model fine-tuning
-Security audits
-Documentation
-
-See CONTRIBUTING.md for guidelines.
-
-📜 License
-This project is licensed under the MIT License - see LICENSE file.
-
-🏆 Hackathon Achievements
-Celo Hackathon Submission
-
-Category: DeFi Innovation
-Built With: Celo, AI, Telegram, Twilio
-Demo Video: Watch Demo
-Live Demo: Try JARVIS
-
-
-📞 Contact & Support
-
-Website: jarvis-celo.io
-Telegram: @JarvisCeloBot
-Twitter: @JarvisOnCelo
-Email: hello@jarvis-celo.io
-Discord: Join Community
-
-
-🙏 Acknowledgments
-
-Celo Foundation for blockchain infrastructure
-OpenAI for GPT-4 AI capabilities
-Twilio for communication APIs
-Telegram for bot platform
